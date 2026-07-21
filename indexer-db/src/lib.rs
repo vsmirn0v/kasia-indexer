@@ -149,4 +149,11 @@ pub enum PartitionId {
     PendingSenders = 14,
     SelfStashByOwner = 15,
     TxIDToSelfStash = 16,
+
+    GroupMessageByBlindedGroupId = 17,
+    TxIdToGroupMessage = 18,
+    GroupInviteByTag = 19,
+    TxIdToGroupInvite = 20,
+    GroupControlBySender = 21,
+    TxIdToGroupControl = 22,
 }

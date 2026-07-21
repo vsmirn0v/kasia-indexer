@@ -16,6 +16,13 @@ use indexer_db::headers::daa_index::DaaIndexPartition;
 use indexer_db::messages::contextual_message::{
     ContextualMessageBySenderPartition, TxIdToContextualMessagePartition,
 };
+use indexer_db::messages::group_control::{
+    GroupControlBySenderPartition, TxIdToGroupControlPartition,
+};
+use indexer_db::messages::group_invite::{GroupInviteByTagPartition, TxIdToGroupInvitePartition};
+use indexer_db::messages::group_message::{
+    GroupMessageByBlindedGroupIdPartition, TxIdToGroupMessagePartition,
+};
 use indexer_db::messages::handshake::{
     HandshakeByReceiverPartition, HandshakeBySenderPartition, TxIdToHandshakePartition,
 };
@@ -79,6 +86,13 @@ async fn main() -> anyhow::Result<()> {
     let tx_id_to_payment_partition = TxIdToPaymentPartition::new(&tx_keyspace)?;
     let self_stash_by_owner_partition = SelfStashByOwnerPartition::new(&tx_keyspace)?;
     let tx_id_to_self_stash_partition = TxIdToSelfStashPartition::new(&tx_keyspace)?;
+    let group_message_by_blinded_group_id_partition =
+        GroupMessageByBlindedGroupIdPartition::new(&tx_keyspace)?;
+    let tx_id_to_group_message_partition = TxIdToGroupMessagePartition::new(&tx_keyspace)?;
+    let group_invite_by_tag_partition = GroupInviteByTagPartition::new(&tx_keyspace)?;
+    let tx_id_to_group_invite_partition = TxIdToGroupInvitePartition::new(&tx_keyspace)?;
+    let group_control_by_sender_partition = GroupControlBySenderPartition::new(&tx_keyspace)?;
+    let tx_id_to_group_control_partition = TxIdToGroupControlPartition::new(&tx_keyspace)?;
     let tx_id_to_acceptance_partition = TxIDToAcceptancePartition::new(&tx_keyspace)?;
     let block_compact_header_partition = BlockCompactHeaderPartition::new(&tx_keyspace)?;
     let acceptance_to_tx_id_partition = AcceptingBlockToTxIDPartition::new(&tx_keyspace)?;
@@ -152,6 +166,14 @@ async fn main() -> anyhow::Result<()> {
         .self_stash_by_owner_partition(self_stash_by_owner_partition.clone())
         .tx_id_to_self_stash_partition(tx_id_to_self_stash_partition.clone())
         .tx_id_to_payment_partition(tx_id_to_payment_partition.clone())
+        .group_message_by_blinded_group_id_partition(
+            group_message_by_blinded_group_id_partition.clone(),
+        )
+        .tx_id_to_group_message_partition(tx_id_to_group_message_partition.clone())
+        .group_invite_by_tag_partition(group_invite_by_tag_partition.clone())
+        .tx_id_to_group_invite_partition(tx_id_to_group_invite_partition.clone())
+        .group_control_by_sender_partition(group_control_by_sender_partition.clone())
+        .tx_id_to_group_control_partition(tx_id_to_group_control_partition.clone())
         .tx_id_to_acceptance_partition(tx_id_to_acceptance_partition.clone())
         .shared_metrics(metrics.clone())
         .build();
@@ -173,6 +195,11 @@ async fn main() -> anyhow::Result<()> {
         .payment_by_receiver_partition(payment_by_receiver_partition.clone())
         .payment_by_sender_partition(payment_by_sender_partition.clone())
         .self_stash_by_owner_partition(self_stash_by_owner_partition.clone())
+        .group_message_by_blinded_group_id_partition(
+            group_message_by_blinded_group_id_partition.clone(),
+        )
+        .group_invite_by_tag_partition(group_invite_by_tag_partition.clone())
+        .group_control_by_sender_partition(group_control_by_sender_partition.clone())
         .runtime(tokio::runtime::Handle::current())
         .build();
 
@@ -243,6 +270,12 @@ async fn main() -> anyhow::Result<()> {
         tx_id_to_payment_partition,
         self_stash_by_owner_partition,
         tx_id_to_self_stash_partition,
+        group_message_by_blinded_group_id_partition,
+        tx_id_to_group_message_partition,
+        group_invite_by_tag_partition,
+        tx_id_to_group_invite_partition,
+        group_control_by_sender_partition,
+        tx_id_to_group_control_partition,
         metrics.clone(),
         context.clone(),
     );

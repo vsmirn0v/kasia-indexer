@@ -7,6 +7,11 @@ use fjall::{TxKeyspace, WriteTransaction};
 use indexer_db::messages::contextual_message::{
     ContextualMessageBySenderKey, ContextualMessageBySenderPartition,
 };
+use indexer_db::messages::group_control::{GroupControlBySenderPartition, GroupControlKeyBySender};
+use indexer_db::messages::group_invite::{GroupInviteByTagPartition, GroupInviteKeyByTag};
+use indexer_db::messages::group_message::{
+    GroupMessageByBlindedGroupIdPartition, GroupMessageKeyByBlindedGroupId,
+};
 use indexer_db::messages::handshake::{
     HandshakeByReceiverPartition, HandshakeBySenderPartition, HandshakeKeyByReceiver,
     HandshakeKeyBySender,
@@ -59,6 +64,10 @@ pub struct VirtualProcessor {
 
     payment_by_receiver_partition: PaymentByReceiverPartition,
     payment_by_sender_partition: PaymentBySenderPartition,
+
+    group_message_by_blinded_group_id_partition: GroupMessageByBlindedGroupIdPartition,
+    group_invite_by_tag_partition: GroupInviteByTagPartition,
+    group_control_by_sender_partition: GroupControlBySenderPartition,
 
     runtime: tokio::runtime::Handle,
 }
@@ -757,7 +766,10 @@ impl VirtualProcessor {
                     | PartitionId::AcceptingBlockToTxIds
                     | PartitionId::TxIdToAcceptance
                     | PartitionId::PendingSenders
-                    | PartitionId::TxIDToSelfStash => {
+                    | PartitionId::TxIDToSelfStash
+                    | PartitionId::TxIdToGroupMessage
+                    | PartitionId::TxIdToGroupInvite
+                    | PartitionId::TxIdToGroupControl => {
                         panic!("Unexpected partition id")
                     }
                     PartitionId::HandshakeByReceiver => size_of::<HandshakeKeyByReceiver>(),
@@ -768,6 +780,11 @@ impl VirtualProcessor {
                     PartitionId::PaymentByReceiver => size_of::<PaymentKeyByReceiver>(),
                     PartitionId::PaymentBySender => size_of::<PaymentKeyBySender>(),
                     PartitionId::SelfStashByOwner => size_of::<SelfStashKeyByOwner>(),
+                    PartitionId::GroupMessageByBlindedGroupId => {
+                        size_of::<GroupMessageKeyByBlindedGroupId>()
+                    }
+                    PartitionId::GroupInviteByTag => size_of::<GroupInviteKeyByTag>(),
+                    PartitionId::GroupControlBySender => size_of::<GroupControlKeyBySender>(),
                 },
                 |wtx, entry| match entry.partition_id {
                     PartitionId::Metadata
@@ -779,7 +796,10 @@ impl VirtualProcessor {
                     | PartitionId::AcceptingBlockToTxIds
                     | PartitionId::TxIdToAcceptance
                     | PartitionId::PendingSenders
-                    | PartitionId::TxIDToSelfStash => {
+                    | PartitionId::TxIDToSelfStash
+                    | PartitionId::TxIdToGroupMessage
+                    | PartitionId::TxIdToGroupInvite
+                    | PartitionId::TxIdToGroupControl => {
                         panic!("Unexpected partition id")
                     }
                     PartitionId::HandshakeByReceiver => {
@@ -844,6 +864,38 @@ impl VirtualProcessor {
                             .map_err(|_| anyhow::anyhow!("Key conversion error"))?;
                         key.owner = sender;
                         self.self_stash_by_owner_partition.insert_wtx(wtx, &key);
+                        Ok(())
+                    }
+                    PartitionId::GroupMessageByBlindedGroupId => {
+                        if !matches!(entry.action, Action::UpdateValueSender) {
+                            panic!("Unexpected action")
+                        }
+                        self.group_message_by_blinded_group_id_partition.insert_wtx(
+                            wtx,
+                            GroupMessageKeyByBlindedGroupId::try_ref_from_bytes(entry.key)
+                                .map_err(|_| anyhow::anyhow!("Key conversion error"))?,
+                            Some(sender),
+                        )
+                    }
+                    PartitionId::GroupInviteByTag => {
+                        if !matches!(entry.action, Action::UpdateValueSender) {
+                            panic!("Unexpected action")
+                        }
+                        self.group_invite_by_tag_partition.insert_wtx(
+                            wtx,
+                            GroupInviteKeyByTag::try_ref_from_bytes(entry.key)
+                                .map_err(|_| anyhow::anyhow!("Key conversion error"))?,
+                            Some(sender),
+                        )
+                    }
+                    PartitionId::GroupControlBySender => {
+                        if !matches!(entry.action, Action::InsertByKeySender) {
+                            panic!("Unexpected action")
+                        }
+                        let mut key = GroupControlKeyBySender::try_read_from_bytes(entry.key)
+                            .map_err(|_| anyhow::anyhow!("Key conversion error"))?;
+                        key.sender = sender;
+                        self.group_control_by_sender_partition.insert_wtx(wtx, &key);
                         Ok(())
                     }
                 },
@@ -938,5 +990,8 @@ mod tests {
         print_size::<PaymentKeyByReceiver>();
         print_size::<PaymentKeyBySender>();
         print_size::<SelfStashKeyByOwner>();
+        print_size::<GroupMessageKeyByBlindedGroupId>();
+        print_size::<GroupInviteKeyByTag>();
+        print_size::<GroupControlKeyBySender>();
     }
 }

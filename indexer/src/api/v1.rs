@@ -1,4 +1,7 @@
 use crate::api::v1::contextual_messages::ContextualMessageApi;
+use crate::api::v1::group_control::GroupControlApi;
+use crate::api::v1::group_invites::GroupInviteApi;
+use crate::api::v1::group_messages::GroupMessageApi;
 use crate::api::v1::handshakes::HandshakeApi;
 use crate::api::v1::payments::PaymentApi;
 use crate::api::v1::self_stash::SelfStashApi;
@@ -10,6 +13,13 @@ use axum::{Json, Router};
 use indexer_actors::metrics::{IndexerMetricsSnapshot, SharedMetrics};
 use indexer_db::messages::contextual_message::{
     ContextualMessageBySenderPartition, TxIdToContextualMessagePartition,
+};
+use indexer_db::messages::group_control::{
+    GroupControlBySenderPartition, TxIdToGroupControlPartition,
+};
+use indexer_db::messages::group_invite::{GroupInviteByTagPartition, TxIdToGroupInvitePartition};
+use indexer_db::messages::group_message::{
+    GroupMessageByBlindedGroupIdPartition, TxIdToGroupMessagePartition,
 };
 use indexer_db::messages::handshake::{
     HandshakeByReceiverPartition, HandshakeBySenderPartition, TxIdToHandshakePartition,
@@ -25,6 +35,9 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 pub mod contextual_messages;
+pub mod group_control;
+pub mod group_invites;
+pub mod group_messages;
 pub mod handshakes;
 pub mod payments;
 pub mod self_stash;
@@ -38,10 +51,13 @@ pub mod self_stash;
         payments::get_payments_by_sender,
         payments::get_payments_by_receiver,
         self_stash::get_self_stash_by_owner,
+        group_messages::get_group_messages_by_blinded_group_id,
+        group_invites::get_group_invites_by_tag,
+        group_control::get_group_control_by_sender,
         get_metrics,
     ),
     components(
-        schemas(handshakes::HandshakeResponse, contextual_messages::ContextualMessageResponse, payments::PaymentResponse, self_stash::SelfStashResponse, IndexerMetricsSnapshot)
+        schemas(handshakes::HandshakeResponse, contextual_messages::ContextualMessageResponse, payments::PaymentResponse, self_stash::SelfStashResponse, group_messages::GroupMessageResponse, group_invites::GroupInviteResponse, group_control::GroupControlResponse, IndexerMetricsSnapshot)
     ),
     tags(
         (name = "Kasia Indexer API", description = "Kasia Indexer API")
@@ -55,6 +71,9 @@ pub struct Api {
     contextual_message_api: ContextualMessageApi,
     payment_api: PaymentApi,
     self_stash_api: SelfStashApi,
+    group_message_api: GroupMessageApi,
+    group_invite_api: GroupInviteApi,
+    group_control_api: GroupControlApi,
     metrics: SharedMetrics,
 }
 
@@ -73,6 +92,12 @@ impl Api {
         tx_id_to_payment_partition: TxIdToPaymentPartition,
         self_stash_by_owner_partition: SelfStashByOwnerPartition,
         tx_id_to_self_stash_partition: TxIdToSelfStashPartition,
+        group_message_by_blinded_group_id_partition: GroupMessageByBlindedGroupIdPartition,
+        tx_id_to_group_message_partition: TxIdToGroupMessagePartition,
+        group_invite_by_tag_partition: GroupInviteByTagPartition,
+        tx_id_to_group_invite_partition: TxIdToGroupInvitePartition,
+        group_control_by_sender_partition: GroupControlBySenderPartition,
+        tx_id_to_group_control_partition: TxIdToGroupControlPartition,
         metrics: SharedMetrics,
         context: IndexerContext,
     ) -> Self {
@@ -103,10 +128,34 @@ impl Api {
         );
 
         let self_stash_api = SelfStashApi::new(
-            tx_keyspace,
+            tx_keyspace.clone(),
             self_stash_by_owner_partition,
-            tx_id_to_acceptance_partition,
+            tx_id_to_acceptance_partition.clone(),
             tx_id_to_self_stash_partition,
+            context.clone(),
+        );
+
+        let group_message_api = GroupMessageApi::new(
+            tx_keyspace.clone(),
+            group_message_by_blinded_group_id_partition,
+            tx_id_to_acceptance_partition.clone(),
+            tx_id_to_group_message_partition,
+            context.clone(),
+        );
+
+        let group_invite_api = GroupInviteApi::new(
+            tx_keyspace.clone(),
+            group_invite_by_tag_partition,
+            tx_id_to_acceptance_partition.clone(),
+            tx_id_to_group_invite_partition,
+            context.clone(),
+        );
+
+        let group_control_api = GroupControlApi::new(
+            tx_keyspace,
+            group_control_by_sender_partition,
+            tx_id_to_acceptance_partition,
+            tx_id_to_group_control_partition,
             context,
         );
 
@@ -115,6 +164,9 @@ impl Api {
             contextual_message_api,
             payment_api,
             self_stash_api,
+            group_message_api,
+            group_invite_api,
+            group_control_api,
             metrics,
         }
     }
@@ -154,6 +206,18 @@ impl Api {
             .nest(
                 "/self-stash",
                 SelfStashApi::router().with_state(self.self_stash_api.clone()),
+            )
+            .nest(
+                "/group-messages",
+                GroupMessageApi::router().with_state(self.group_message_api.clone()),
+            )
+            .nest(
+                "/group-invites",
+                GroupInviteApi::router().with_state(self.group_invite_api.clone()),
+            )
+            .nest(
+                "/group-control",
+                GroupControlApi::router().with_state(self.group_control_api.clone()),
             )
             .route(
                 "/metrics",

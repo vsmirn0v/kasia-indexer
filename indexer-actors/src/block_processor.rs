@@ -14,6 +14,16 @@ use indexer_db::messages::contextual_message::{
     ContextualMessageBySenderKey, ContextualMessageBySenderPartition,
     TxIdToContextualMessagePartition,
 };
+use indexer_db::messages::group_control::{
+    GroupControlBySenderPartition, GroupControlKeyBySender, TxIdToGroupControlPartition,
+};
+use indexer_db::messages::group_invite::{
+    GroupInviteByTagPartition, GroupInviteKeyByTag, INVITE_TAG_LEN, TxIdToGroupInvitePartition,
+};
+use indexer_db::messages::group_message::{
+    BLINDED_GROUP_ID_LEN, GroupMessageByBlindedGroupIdPartition, GroupMessageKeyByBlindedGroupId,
+    TxIdToGroupMessagePartition,
+};
 use indexer_db::messages::handshake::{
     HandshakeByReceiverPartition, HandshakeBySenderPartition, HandshakeKeyByReceiver,
     HandshakeKeyBySender, TxIdToHandshakePartition,
@@ -35,8 +45,9 @@ use kaspa_rpc_core::{RpcBlock, RpcHeader, RpcTransaction, RpcTransactionId};
 pub use message::*;
 use protocol::operation::deserializer::parse_sealed_operation;
 use protocol::operation::{
-    SealedContextualMessageV1, SealedHandshakeV2, SealedMessageOrSealedHandshakeVNone,
-    SealedOperation, SealedPaymentV1, SealedSelfStashV1,
+    SealedContextualMessageV1, SealedGroupControlV1, SealedGroupInviteV1, SealedGroupMessageV1,
+    SealedHandshakeV2, SealedMessageOrSealedHandshakeVNone, SealedOperation, SealedPaymentV1,
+    SealedSelfStashV1,
 };
 use smallvec::SmallVec;
 use std::collections::HashMap;
@@ -66,6 +77,12 @@ pub struct BlockProcessor {
     payment_by_receiver_partition: PaymentByReceiverPartition,
     payment_by_sender_partition: PaymentBySenderPartition,
     tx_id_to_payment_partition: TxIdToPaymentPartition,
+    group_message_by_blinded_group_id_partition: GroupMessageByBlindedGroupIdPartition,
+    tx_id_to_group_message_partition: TxIdToGroupMessagePartition,
+    group_invite_by_tag_partition: GroupInviteByTagPartition,
+    tx_id_to_group_invite_partition: TxIdToGroupInvitePartition,
+    group_control_by_sender_partition: GroupControlBySenderPartition,
+    tx_id_to_group_control_partition: TxIdToGroupControlPartition,
     tx_id_to_acceptance_partition: TxIDToAcceptancePartition,
     shared_metrics: SharedMetrics,
     #[builder(default)]
@@ -423,6 +440,16 @@ impl BlockProcessor {
                 );
                 Ok(())
             }
+            SealedOperation::GroupMessageV1(gm) => {
+                self.handle_group_message(&mut entries, wtx, block_header, tx_id, gm, sender)
+            }
+            SealedOperation::GroupInviteV1(gi) => {
+                self.handle_group_invite(&mut entries, wtx, block_header, tx_id, gi, sender)
+            }
+            SealedOperation::GroupControlV1(gc) => {
+                self.handle_group_control(&mut entries, wtx, sender, block_header, tx_id, gc);
+                Ok(())
+            }
         })?;
         self.tx_id_to_acceptance_partition.insert_wtx(
             wtx,
@@ -712,6 +739,122 @@ impl BlockProcessor {
             });
         }
     }
+
+    fn handle_group_message<const ENTRIES_LEN: usize, const KEY_SIZE: usize>(
+        &self,
+        entries: &mut SmallVec<[InsertionEntry<KEY_SIZE>; ENTRIES_LEN]>,
+        wtx: &mut WriteTransaction,
+        block: &RpcHeader,
+        tx_id: RpcTransactionId,
+        op: SealedGroupMessageV1,
+        sender: Option<AddressPayload>,
+    ) -> anyhow::Result<()> {
+        debug!(%tx_id, sender = ?sender, "Handling group message transaction");
+        self.tx_id_to_group_message_partition
+            .insert_wtx(wtx, tx_id.as_ref(), op.sealed_hex);
+        let key = GroupMessageKeyByBlindedGroupId {
+            blinded_group_id: decode_fixed_hex::<BLINDED_GROUP_ID_LEN>(op.blinded_group_id),
+            block_time: block.timestamp.into(),
+            block_hash: block.hash.as_bytes(),
+            version: 1,
+            tx_id: tx_id.as_bytes(),
+        };
+        self.group_message_by_blinded_group_id_partition
+            .insert_wtx(wtx, &key, sender)?;
+        if sender.is_none() {
+            trace!("No sender resolved for group message");
+            entries.push(InsertionEntry {
+                partition_id: PartitionId::GroupMessageByBlindedGroupId,
+                action: Action::UpdateValueSender,
+                partition_key: SmallVec::from_slice(key.as_bytes()),
+            });
+        }
+        Ok(())
+    }
+
+    fn handle_group_invite<const ENTRIES_LEN: usize, const KEY_SIZE: usize>(
+        &self,
+        entries: &mut SmallVec<[InsertionEntry<KEY_SIZE>; ENTRIES_LEN]>,
+        wtx: &mut WriteTransaction,
+        block: &RpcHeader,
+        tx_id: RpcTransactionId,
+        op: SealedGroupInviteV1,
+        sender: Option<AddressPayload>,
+    ) -> anyhow::Result<()> {
+        debug!(%tx_id, sender = ?sender, "Handling group invite transaction");
+        self.tx_id_to_group_invite_partition
+            .insert_wtx(wtx, tx_id.as_ref(), op.encrypted_payload);
+        let key = GroupInviteKeyByTag {
+            invite_tag: decode_fixed_hex::<INVITE_TAG_LEN>(op.invite_tag),
+            block_time: block.timestamp.into(),
+            block_hash: block.hash.as_bytes(),
+            version: 1,
+            tx_id: tx_id.as_bytes(),
+        };
+        self.group_invite_by_tag_partition
+            .insert_wtx(wtx, &key, sender)?;
+        if sender.is_none() {
+            trace!("No sender resolved for group invite");
+            entries.push(InsertionEntry {
+                partition_id: PartitionId::GroupInviteByTag,
+                action: Action::UpdateValueSender,
+                partition_key: SmallVec::from_slice(key.as_bytes()),
+            });
+        }
+        Ok(())
+    }
+
+    fn handle_group_control<const ENTRIES_LEN: usize, const KEY_SIZE: usize>(
+        &self,
+        entries: &mut SmallVec<[InsertionEntry<KEY_SIZE>; ENTRIES_LEN]>,
+        wtx: &mut WriteTransaction,
+        sender: Option<AddressPayload>,
+        block_header: &RpcHeader,
+        tx_id: RpcTransactionId,
+        gc: SealedGroupControlV1,
+    ) {
+        debug!(%tx_id, sender = ?sender, "Handling group control transaction");
+        self.tx_id_to_group_control_partition
+            .insert_wtx(wtx, tx_id.as_ref(), gc.sealed_hex);
+        let key = GroupControlKeyBySender {
+            sender: sender.unwrap_or_default(),
+            block_time: block_header.timestamp.into(),
+            block_hash: block_header.hash.as_bytes(),
+            version: 1,
+            tx_id: tx_id.as_bytes(),
+        };
+        if sender.is_some() {
+            self.group_control_by_sender_partition.insert_wtx(wtx, &key);
+        } else {
+            trace!("No sender resolved for group control");
+            entries.push(InsertionEntry {
+                partition_id: PartitionId::GroupControlBySender,
+                action: Action::InsertByKeySender,
+                partition_key: SmallVec::from_slice(key.as_bytes()),
+            });
+        }
+    }
+}
+
+/// Decodes an exact-length hex-ascii field (as sliced verbatim out of the on-chain payload)
+/// into fixed-size raw bytes for use as a compact partition key. Falls back to a zeroed
+/// array (rather than dropping the transaction) if the field is malformed, mirroring the
+/// graceful degradation used elsewhere for untrusted on-chain input.
+fn decode_fixed_hex<const N: usize>(hex_bytes: &[u8]) -> [u8; N] {
+    if hex_bytes.len() != N * 2 {
+        warn!(
+            expected_len = N * 2,
+            actual_len = hex_bytes.len(),
+            "Unexpected hex field length"
+        );
+        return [0u8; N];
+    }
+    let mut out = [0u8; N];
+    if let Err(err) = faster_hex::hex_decode(hex_bytes, &mut out) {
+        warn!(%err, "Invalid hex encountered while decoding fixed-length field");
+        return [0u8; N];
+    }
+    out
 }
 
 impl Drop for BlockProcessor {

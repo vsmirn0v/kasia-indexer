@@ -47,24 +47,14 @@ impl WatchedAddressPartition {
         )?))
     }
 
-    pub fn insert_wtx(
-        &self,
-        wtx: &mut WriteTransaction,
-        address: &AddressPayload,
-        token: &[u8],
-    ) {
+    pub fn insert_wtx(&self, wtx: &mut WriteTransaction, address: &AddressPayload, token: &[u8]) {
         let mut key = Vec::with_capacity(address.as_bytes().len() + token.len());
         key.extend_from_slice(address.as_bytes());
         key.extend_from_slice(token);
         wtx.insert(&self.0, key, []);
     }
 
-    pub fn remove_wtx(
-        &self,
-        wtx: &mut WriteTransaction,
-        address: &AddressPayload,
-        token: &[u8],
-    ) {
+    pub fn remove_wtx(&self, wtx: &mut WriteTransaction, address: &AddressPayload, token: &[u8]) {
         let mut key = Vec::with_capacity(address.as_bytes().len() + token.len());
         key.extend_from_slice(address.as_bytes());
         key.extend_from_slice(token);
@@ -79,12 +69,87 @@ impl WatchedAddressPartition {
         &self,
         rtx: &ReadTransaction,
         address: &AddressPayload,
-    ) -> impl DoubleEndedIterator<Item = anyhow::Result<SharedImmutable<[u8]>>> + '_
-    {
+    ) -> impl DoubleEndedIterator<Item = anyhow::Result<SharedImmutable<[u8]>>> + '_ {
         let prefix = address.as_bytes();
         rtx.prefix(&self.0, prefix).map(|item| {
             let (key_bytes, _value_bytes) = item?;
             Ok(SharedImmutable::new(key_bytes))
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct WatchedGroupIdPartition(fjall::TxPartition);
+
+impl WatchedGroupIdPartition {
+    pub fn new(keyspace: &fjall::TxKeyspace) -> anyhow::Result<Self> {
+        Ok(Self(keyspace.open_partition(
+            "watched_group_id_to_device",
+            PartitionCreateOptions::default(),
+        )?))
+    }
+
+    pub fn insert_wtx(&self, wtx: &mut WriteTransaction, group_id: &[u8; 32], token: &[u8]) {
+        let mut key = Vec::with_capacity(group_id.len() + token.len());
+        key.extend_from_slice(group_id);
+        key.extend_from_slice(token);
+        wtx.insert(&self.0, key, []);
+    }
+
+    pub fn remove_wtx(&self, wtx: &mut WriteTransaction, group_id: &[u8; 32], token: &[u8]) {
+        let mut key = Vec::with_capacity(group_id.len() + token.len());
+        key.extend_from_slice(group_id);
+        key.extend_from_slice(token);
+        wtx.remove(&self.0, key);
+    }
+
+    pub fn get_by_group_id_prefix(
+        &self,
+        rtx: &ReadTransaction,
+        group_id: &[u8; 32],
+    ) -> impl DoubleEndedIterator<Item = anyhow::Result<SharedImmutable<[u8]>>> + '_ {
+        rtx.prefix(&self.0, group_id).map(|item| {
+            let (key, _) = item?;
+            Ok(SharedImmutable::new(key))
+        })
+    }
+}
+
+/// Reverse index used only for recipient-addressed group control delivery. Unlike
+/// `WatchedAddressPartition`, this maps the device owner's authenticated primary address.
+#[derive(Clone)]
+pub struct PrimaryAddressPartition(fjall::TxPartition);
+
+impl PrimaryAddressPartition {
+    pub fn new(keyspace: &fjall::TxKeyspace) -> anyhow::Result<Self> {
+        Ok(Self(keyspace.open_partition(
+            "primary_address_to_device",
+            PartitionCreateOptions::default(),
+        )?))
+    }
+
+    pub fn insert_wtx(&self, wtx: &mut WriteTransaction, address: &AddressPayload, token: &[u8]) {
+        let mut key = Vec::with_capacity(address.as_bytes().len() + token.len());
+        key.extend_from_slice(address.as_bytes());
+        key.extend_from_slice(token);
+        wtx.insert(&self.0, key, []);
+    }
+
+    pub fn remove_wtx(&self, wtx: &mut WriteTransaction, address: &AddressPayload, token: &[u8]) {
+        let mut key = Vec::with_capacity(address.as_bytes().len() + token.len());
+        key.extend_from_slice(address.as_bytes());
+        key.extend_from_slice(token);
+        wtx.remove(&self.0, key);
+    }
+
+    pub fn get_by_address_prefix(
+        &self,
+        rtx: &ReadTransaction,
+        address: &AddressPayload,
+    ) -> impl DoubleEndedIterator<Item = anyhow::Result<SharedImmutable<[u8]>>> + '_ {
+        rtx.prefix(&self.0, address.as_bytes()).map(|item| {
+            let (key, _) = item?;
+            Ok(SharedImmutable::new(key))
         })
     }
 }

@@ -6,6 +6,8 @@ pub enum PushEventKind {
     Payment,
     Handshake,
     SelfStash,
+    GroupMessage,
+    GroupControl,
 }
 
 #[derive(Debug, Clone)]
@@ -20,6 +22,9 @@ pub struct PushEvent {
     pub payload: Option<String>,
     pub timestamp: u64,
     pub daa_score: u64,
+    pub blinded_group_id: Option<[u8; 32]>,
+    /// Exact destination for recipient-addressed `gctl`; `None` denotes legacy control.
+    pub group_control_recipient: Option<AddressPayload>,
 }
 
 pub fn parse_self_stash_alias(raw: &[u8]) -> Option<String> {

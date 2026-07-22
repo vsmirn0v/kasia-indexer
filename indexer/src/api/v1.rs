@@ -1,17 +1,25 @@
 use crate::api::v1::contextual_messages::ContextualMessageApi;
+use crate::api::v1::group_control::GroupControlApi;
+use crate::api::v1::group_messages::GroupMessageApi;
 use crate::api::v1::handshakes::HandshakeApi;
 use crate::api::v1::payments::PaymentApi;
 use crate::api::v1::push::PushApi;
 use crate::api::v1::self_stash::SelfStashApi;
 use crate::context::IndexerContext;
-use axum::Router;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use axum::routing::get;
+use axum::{Json, Router};
 use indexer_actors::metrics::{IndexerMetricsSnapshot, SharedMetrics};
 use indexer_db::messages::contextual_message::{
     ContextualMessageBySenderPartition, TxIdToContextualMessagePartition,
+};
+use indexer_db::messages::group_control::{
+    GroupControlByRecipientPartition, GroupControlBySenderPartition, TxIdToGroupControlPartition,
+};
+use indexer_db::messages::group_message::{
+    GroupMessageByBlindedGroupIdPartition, TxIdToGroupMessagePartition,
 };
 use indexer_db::messages::handshake::{
     HandshakeByReceiverPartition, HandshakeBySenderPartition, TxIdToHandshakePartition,
@@ -26,6 +34,8 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 pub mod contextual_messages;
+pub mod group_control;
+pub mod group_messages;
 pub mod handshakes;
 pub mod payments;
 mod prometheus;
@@ -45,10 +55,14 @@ pub mod self_stash;
         push::register_device,
         push::update_registration,
         push::unregister_device,
+        group_messages::get_group_messages_by_blinded_group_id,
+        group_control::get_group_control_by_sender,
+        group_control::get_group_control_by_recipient,
         get_metrics,
+        get_prometheus_metrics,
     ),
     components(
-        schemas(handshakes::HandshakeResponse, contextual_messages::ContextualMessageResponse, payments::PaymentResponse, self_stash::SelfStashResponse, push::PushRegistrationRequest, push::PushUpdateRequest, push::PushUnregisterRequest, push::PushAuthRequest, push::PushChallengeResponse, push::PushResponse, push::ErrorResponse, IndexerMetricsSnapshot)
+        schemas(handshakes::HandshakeResponse, contextual_messages::ContextualMessageResponse, payments::PaymentResponse, self_stash::SelfStashResponse, push::PushRegistrationRequest, push::PushUpdateRequest, push::PushUnregisterRequest, push::PushAuthRequest, push::PushChallengeResponse, push::PushResponse, push::ErrorResponse, group_messages::GroupMessageResponse, group_control::GroupControlResponse, IndexerMetricsSnapshot)
     ),
     tags(
         (name = "Kasia Indexer API", description = "Kasia Indexer API")
@@ -63,6 +77,8 @@ pub struct Api {
     payment_api: PaymentApi,
     self_stash_api: SelfStashApi,
     push_api: PushApi,
+    group_message_api: GroupMessageApi,
+    group_control_api: GroupControlApi,
     metrics: SharedMetrics,
 }
 
@@ -83,6 +99,11 @@ impl Api {
         tx_id_to_payment_partition: TxIdToPaymentPartition,
         self_stash_by_owner_partition: SelfStashByOwnerPartition,
         tx_id_to_self_stash_partition: TxIdToSelfStashPartition,
+        group_message_by_blinded_group_id_partition: GroupMessageByBlindedGroupIdPartition,
+        tx_id_to_group_message_partition: TxIdToGroupMessagePartition,
+        group_control_by_sender_partition: GroupControlBySenderPartition,
+        group_control_by_recipient_partition: GroupControlByRecipientPartition,
+        tx_id_to_group_control_partition: TxIdToGroupControlPartition,
         metrics: SharedMetrics,
         push_api: PushApi,
         context: IndexerContext,
@@ -117,10 +138,29 @@ impl Api {
         );
 
         let self_stash_api = SelfStashApi::new(
-            tx_keyspace,
+            tx_keyspace.clone(),
             self_stash_by_owner_partition,
-            tx_id_to_acceptance_partition,
+            tx_id_to_acceptance_partition.clone(),
             tx_id_to_self_stash_partition,
+            metrics.clone(),
+            context.clone(),
+        );
+
+        let group_message_api = GroupMessageApi::new(
+            tx_keyspace.clone(),
+            group_message_by_blinded_group_id_partition,
+            tx_id_to_acceptance_partition.clone(),
+            tx_id_to_group_message_partition,
+            metrics.clone(),
+            context.clone(),
+        );
+
+        let group_control_api = GroupControlApi::new(
+            tx_keyspace,
+            group_control_by_sender_partition,
+            group_control_by_recipient_partition,
+            tx_id_to_acceptance_partition,
+            tx_id_to_group_control_partition,
             metrics.clone(),
             context,
         );
@@ -131,6 +171,8 @@ impl Api {
             payment_api,
             self_stash_api,
             push_api,
+            group_message_api,
+            group_control_api,
             metrics,
         }
     }
@@ -176,9 +218,21 @@ impl Api {
                 SelfStashApi::router().with_state(self.self_stash_api.clone()),
             )
             .nest("/v1/push", push_router)
+            .nest(
+                "/group-messages",
+                GroupMessageApi::router().with_state(self.group_message_api.clone()),
+            )
+            .nest(
+                "/group-control",
+                GroupControlApi::router().with_state(self.group_control_api.clone()),
+            )
             .route(
                 "/metrics",
                 get(get_metrics).with_state(self.metrics.clone()),
+            )
+            .route(
+                "/metrics/prometheus",
+                get(get_prometheus_metrics).with_state(self.metrics.clone()),
             )
     }
 }
@@ -187,10 +241,21 @@ impl Api {
     get,
     path = "/metrics",
     responses(
+        (status = 200, description = "Get metrics as JSON", body = IndexerMetricsSnapshot)
+    )
+)]
+async fn get_metrics(State(metrics): State<SharedMetrics>) -> Json<IndexerMetricsSnapshot> {
+    Json(metrics.snapshot())
+}
+
+#[utoipa::path(
+    get,
+    path = "/metrics/prometheus",
+    responses(
         (status = 200, description = "Get Prometheus metrics", content_type = "text/plain", body = String)
     )
 )]
-async fn get_metrics(State(metrics): State<SharedMetrics>) -> impl IntoResponse {
+async fn get_prometheus_metrics(State(metrics): State<SharedMetrics>) -> impl IntoResponse {
     (
         [(CONTENT_TYPE, prometheus::CONTENT_TYPE)],
         prometheus::render(&metrics.snapshot()),

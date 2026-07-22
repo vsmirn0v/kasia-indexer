@@ -1,5 +1,5 @@
 use crate::config::PushAuthMode;
-use crate::push::{DeviceKeyBinding, PushRegistryHandle, WalletBinding};
+use crate::push::{DeviceKeyBinding, GROUP_V1_CAPABILITY, PushRegistryHandle, WalletBinding};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -21,7 +21,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 use utoipa::ToSchema;
 
-const AUTH_DOMAIN: &str = "kasia-push-auth:v1";
+const AUTH_DOMAIN_V1: &str = "kasia-push-auth:v1";
+const AUTH_DOMAIN_V2: &str = "kasia-push-auth:v2";
 const DEVICE_AUTH_DOMAIN: &str = "kasia-push-device-auth:v1";
 const DEVICE_AUTH_SCHEME: &str = "device_key_v1";
 const NONCE_TTL_MS: u64 = 60_000;
@@ -70,6 +71,11 @@ pub struct PushRegistrationRequest {
     #[serde(rename = "watched_addresses")]
     pub watched_addresses: Vec<String>,
     #[serde(default)]
+    #[serde(rename = "watched_group_ids")]
+    pub watched_group_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
     #[serde(rename = "primary_address")]
     pub primary_address: Option<String>,
     #[serde(default)]
@@ -84,6 +90,11 @@ pub struct PushUpdateRequest {
     pub device_token: String,
     #[serde(rename = "watched_addresses")]
     pub watched_addresses: Vec<String>,
+    #[serde(default)]
+    #[serde(rename = "watched_group_ids")]
+    pub watched_group_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     #[serde(default)]
     #[serde(rename = "primary_address")]
     pub primary_address: Option<String>,
@@ -103,6 +114,8 @@ pub struct PushUnregisterRequest {
 
 #[derive(Debug, Deserialize, ToSchema, Clone)]
 pub struct PushAuthRequest {
+    #[serde(default)]
+    pub auth_version: Option<u8>,
     #[serde(rename = "wallet_pubkey")]
     pub wallet_pubkey: String,
     #[serde(rename = "wallet_address")]
@@ -149,6 +162,7 @@ pub struct PushDeviceAuthRequest {
 struct VerifiedPushAuth {
     wallet_binding: Option<WalletBinding>,
     device_binding: Option<DeviceKeyBinding>,
+    capabilities: Vec<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -223,6 +237,8 @@ async fn register_device(
         "/v1/push/register",
         &payload.device_token,
         &payload.watched_addresses,
+        payload.watched_group_ids.as_deref(),
+        &payload.capabilities,
         payload.primary_address.as_deref(),
         &payload.aliases,
         payload.auth.as_ref(),
@@ -240,6 +256,8 @@ async fn register_device(
             payload.device_token,
             payload.platform,
             payload.watched_addresses,
+            payload.watched_group_ids.unwrap_or_default(),
+            verified_auth.capabilities,
             payload.primary_address,
             payload.aliases,
             verified_auth.wallet_binding,
@@ -281,6 +299,8 @@ async fn update_registration(
         "/v1/push/update",
         &payload.device_token,
         &payload.watched_addresses,
+        payload.watched_group_ids.as_deref(),
+        &payload.capabilities,
         payload.primary_address.as_deref(),
         &payload.aliases,
         payload.auth.as_ref(),
@@ -297,6 +317,8 @@ async fn update_registration(
         .update(
             payload.device_token,
             payload.watched_addresses,
+            payload.watched_group_ids.unwrap_or_default(),
+            verified_auth.capabilities,
             payload.primary_address,
             payload.aliases,
             verified_auth.wallet_binding,
@@ -373,17 +395,25 @@ async fn unregister_device(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn authenticate_push_request(
     state: &PushApi,
     method: &str,
     path: &str,
     device_token: &str,
     watched_addresses: &[String],
+    watched_group_ids: Option<&[String]>,
+    requested_capabilities: &[String],
     primary_address: Option<&str>,
     aliases: &[String],
     auth: Option<&PushAuthRequest>,
 ) -> Result<VerifiedPushAuth, PushApiError> {
     let Some(auth) = auth else {
+        if watched_group_ids.is_some() || !requested_capabilities.is_empty() {
+            return Err(PushApiError::unauthorized(
+                "Signed auth is required for group push registration",
+            ));
+        }
         return match state.auth_mode {
             PushAuthMode::Strict => Err(PushApiError::unauthorized(
                 "Signed auth is required for push mutations",
@@ -391,6 +421,7 @@ fn authenticate_push_request(
             PushAuthMode::Legacy | PushAuthMode::Mixed => Ok(VerifiedPushAuth {
                 wallet_binding: None,
                 device_binding: None,
+                capabilities: Vec::new(),
             }),
         };
     };
@@ -399,16 +430,32 @@ fn authenticate_push_request(
     validate_auth_timing(auth, now_ms)?;
     let normalized_device_token = normalize_device_token(device_token)?;
     let normalized_primary = normalize_primary_for_auth(primary_address)?;
+    let auth_format = select_auth_format(auth, watched_group_ids, requested_capabilities)?;
+    let watched_group_ids = watched_group_ids.unwrap_or_default();
+    let capabilities =
+        effective_capabilities(auth_format, watched_group_ids, requested_capabilities)?;
     let wallet_binding = verify_wallet_binding_from_auth(
         state,
         method,
         path,
         &normalized_device_token,
         watched_addresses,
+        watched_group_ids,
+        &capabilities,
+        auth_format,
         &normalized_primary,
         aliases,
         auth,
     )?;
+    if capabilities
+        .iter()
+        .any(|capability| capability == GROUP_V1_CAPABILITY)
+        && normalized_primary != wallet_binding.wallet_address
+    {
+        return Err(PushApiError::unauthorized(
+            "primary_address must match the authenticated wallet for group push",
+        ));
+    }
     let device_binding =
         verify_device_key_binding_from_auth(method, path, &normalized_device_token, auth)?;
 
@@ -417,6 +464,7 @@ fn authenticate_push_request(
     Ok(VerifiedPushAuth {
         wallet_binding: Some(wallet_binding),
         device_binding,
+        capabilities,
     })
 }
 
@@ -433,6 +481,7 @@ fn authenticate_unregister_request(
             PushAuthMode::Legacy | PushAuthMode::Mixed => Ok(VerifiedPushAuth {
                 wallet_binding: None,
                 device_binding: None,
+                capabilities: Vec::new(),
             }),
         };
     };
@@ -446,6 +495,9 @@ fn authenticate_unregister_request(
         "/v1/push/unregister",
         &normalized_device_token,
         &[],
+        &[],
+        &[],
+        select_auth_format(auth, None, &[])?,
         "",
         &[],
         auth,
@@ -469,6 +521,7 @@ fn authenticate_unregister_request(
     Ok(VerifiedPushAuth {
         wallet_binding,
         device_binding,
+        capabilities: Vec::new(),
     })
 }
 
@@ -488,12 +541,16 @@ fn consume_nonce(state: &PushApi, auth: &PushAuthRequest, now_ms: u64) -> Result
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_wallet_binding_from_auth(
     state: &PushApi,
     method: &str,
     path: &str,
     normalized_device_token: &str,
     watched_addresses: &[String],
+    watched_group_ids: &[String],
+    capabilities: &[String],
+    auth_format: AuthPreimageFormat,
     normalized_primary: &str,
     aliases: &[String],
     auth: &PushAuthRequest,
@@ -508,11 +565,14 @@ fn verify_wallet_binding_from_auth(
     }
 
     let preimage = build_auth_preimage(AuthPreimage {
+        format: auth_format,
         nonce: auth.nonce.trim(),
         method,
         path,
         device_token: normalized_device_token,
         watched_addresses,
+        watched_group_ids,
+        capabilities,
         primary_address: normalized_primary,
         aliases,
         wallet_pubkey: &wallet_pubkey,
@@ -673,7 +733,7 @@ fn normalize_device_token(token: &str) -> Result<String, PushApiError> {
         .chars()
         .filter(|character| character.is_ascii_hexdigit())
         .collect();
-    if cleaned.len() < 64 || cleaned.len() > 512 || cleaned.len() % 2 != 0 {
+    if cleaned.len() < 64 || cleaned.len() > 512 || !cleaned.len().is_multiple_of(2) {
         return Err(PushApiError::bad_request("Invalid device token length"));
     }
     Ok(cleaned.to_ascii_lowercase())
@@ -699,7 +759,7 @@ fn normalize_hex_field(
 
 fn decode_hex(value: &str, field: &str) -> Result<Vec<u8>, PushApiError> {
     let normalized = value.trim();
-    if normalized.len() % 2 != 0 {
+    if !normalized.len().is_multiple_of(2) {
         return Err(PushApiError::bad_request(format!(
             "{field} must be even-length hex",
         )));
@@ -777,11 +837,14 @@ fn verify_p256_signature(public_key: &[u8], message: &[u8], signature: &[u8]) ->
 }
 
 struct AuthPreimage<'a> {
+    format: AuthPreimageFormat,
     nonce: &'a str,
     method: &'a str,
     path: &'a str,
     device_token: &'a str,
     watched_addresses: &'a [String],
+    watched_group_ids: &'a [String],
+    capabilities: &'a [String],
     primary_address: &'a str,
     aliases: &'a [String],
     wallet_pubkey: &'a str,
@@ -801,27 +864,105 @@ struct DeviceAuthPreimage<'a> {
     expires_at_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthPreimageFormat {
+    LegacyV1,
+    TransitionalGroups,
+    V2,
+}
+
+fn select_auth_format(
+    auth: &PushAuthRequest,
+    watched_group_ids: Option<&[String]>,
+    capabilities: &[String],
+) -> Result<AuthPreimageFormat, PushApiError> {
+    match auth.auth_version {
+        None | Some(1) if capabilities.is_empty() => {
+            if watched_group_ids.is_some() {
+                Ok(AuthPreimageFormat::TransitionalGroups)
+            } else {
+                Ok(AuthPreimageFormat::LegacyV1)
+            }
+        }
+        None | Some(1) => Err(PushApiError::bad_request(
+            "capabilities require auth_version=2",
+        )),
+        Some(2) => Ok(AuthPreimageFormat::V2),
+        Some(_) => Err(PushApiError::bad_request("Unsupported auth_version")),
+    }
+}
+
+fn effective_capabilities(
+    format: AuthPreimageFormat,
+    watched_group_ids: &[String],
+    requested: &[String],
+) -> Result<Vec<String>, PushApiError> {
+    match format {
+        AuthPreimageFormat::LegacyV1 => Ok(Vec::new()),
+        AuthPreimageFormat::TransitionalGroups => Ok(vec![GROUP_V1_CAPABILITY.to_string()]),
+        AuthPreimageFormat::V2 => {
+            let capabilities = canonicalize_capabilities(requested)?;
+            if !watched_group_ids.is_empty()
+                && !capabilities
+                    .iter()
+                    .any(|capability| capability == GROUP_V1_CAPABILITY)
+            {
+                return Err(PushApiError::bad_request(
+                    "watched_group_ids require the group_v1 capability",
+                ));
+            }
+            Ok(capabilities)
+        }
+    }
+}
+
 fn build_auth_preimage(preimage: AuthPreimage<'_>) -> String {
     let watched_hash =
         hash_string(&canonicalize_watched_addresses(preimage.watched_addresses).join("\n"));
+    let watched_group_ids_hash =
+        hash_string(&canonicalize_watched_group_ids(preimage.watched_group_ids).join("\n"));
+    let capabilities_hash =
+        hash_string(&canonicalize_capabilities_for_hash(preimage.capabilities).join("\n"));
     let aliases_hash = hash_string(&canonicalize_aliases(preimage.aliases).join("\n"));
     let device_token_hash = hash_string(preimage.device_token);
 
-    [
-        format!("domain={AUTH_DOMAIN}"),
+    let mut lines = vec![
+        format!(
+            "domain={}",
+            match preimage.format {
+                AuthPreimageFormat::LegacyV1 | AuthPreimageFormat::TransitionalGroups => {
+                    AUTH_DOMAIN_V1
+                }
+                AuthPreimageFormat::V2 => AUTH_DOMAIN_V2,
+            }
+        ),
         format!("nonce={}", preimage.nonce),
         format!("method={}", preimage.method),
         format!("path={}", preimage.path),
         format!("device_token_hash={device_token_hash}"),
         format!("watched_addresses_hash={watched_hash}"),
+    ];
+    if matches!(preimage.format, AuthPreimageFormat::V2) {
+        lines.insert(1, "auth_version=2".to_string());
+    }
+    if matches!(
+        preimage.format,
+        AuthPreimageFormat::TransitionalGroups | AuthPreimageFormat::V2
+    ) {
+        lines.push(format!("watched_group_ids_hash={watched_group_ids_hash}"));
+    }
+    if matches!(preimage.format, AuthPreimageFormat::V2) {
+        lines.push(format!("capabilities_hash={capabilities_hash}"));
+    }
+    lines.extend([
         format!("primary_address={}", preimage.primary_address),
         format!("aliases_hash={aliases_hash}"),
         format!("wallet_pubkey={}", preimage.wallet_pubkey),
         format!("wallet_address={}", preimage.wallet_address),
         format!("timestamp_ms={}", preimage.timestamp_ms),
         format!("expires_at_ms={}", preimage.expires_at_ms),
-    ]
-    .join("\n")
+    ]);
+    lines.join("\n")
 }
 
 fn build_device_auth_preimage(preimage: DeviceAuthPreimage<'_>) -> String {
@@ -859,6 +1000,38 @@ fn canonicalize_aliases(values: &[String]) -> Vec<String> {
         } else {
             Some(trimmed.to_string())
         }
+    })
+}
+
+fn canonicalize_watched_group_ids(values: &[String]) -> Vec<String> {
+    canonicalize_set(values, |value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_ascii_lowercase())
+    })
+}
+
+fn canonicalize_capabilities(values: &[String]) -> Result<Vec<String>, PushApiError> {
+    let values = canonicalize_capabilities_for_hash(values);
+    if values.len() > 32 {
+        return Err(PushApiError::bad_request("Too many capabilities"));
+    }
+    if values.iter().any(|value| {
+        value.len() > 64
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'_' | b'-' | b'.')
+            })
+    }) {
+        return Err(PushApiError::bad_request("Invalid capability"));
+    }
+    Ok(values)
+}
+
+fn canonicalize_capabilities_for_hash(values: &[String]) -> Vec<String> {
+    canonicalize_set(values, |value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_ascii_lowercase())
     })
 }
 
@@ -1082,13 +1255,18 @@ mod tests {
             derive_wallet_address(&wallet_pubkey, RpcNetworkType::Mainnet).expect("address");
 
         let watched_addresses = vec!["kaspa:qqexamplewatch".to_string()];
+        let watched_group_ids = Vec::new();
+        let capabilities = Vec::new();
         let aliases = vec!["alias-a".to_string(), "alias-b".to_string()];
         let preimage = build_auth_preimage(AuthPreimage {
+            format: AuthPreimageFormat::LegacyV1,
             nonce: "abcd",
             method: "POST",
             path: "/v1/push/register",
             device_token: "00112233445566778899aabbccddeeff",
             watched_addresses: &watched_addresses,
+            watched_group_ids: &watched_group_ids,
+            capabilities: &capabilities,
             primary_address: &wallet_address,
             aliases: &aliases,
             wallet_pubkey: &wallet_pubkey,
@@ -1104,6 +1282,72 @@ mod tests {
 
         verify_schnorr_signature(&wallet_pubkey, &preimage, &signature_hex)
             .expect("signature should verify");
+    }
+
+    #[test]
+    fn auth_preimages_preserve_legacy_and_transitional_shapes() {
+        let watched = vec!["kaspa:qexample".to_string()];
+        let groups = vec!["ab".repeat(32)];
+        let capabilities = vec![GROUP_V1_CAPABILITY.to_string()];
+        let make = |format| {
+            build_auth_preimage(AuthPreimage {
+                format,
+                nonce: "n",
+                method: "POST",
+                path: "/v1/push/register",
+                device_token: "aa",
+                watched_addresses: &watched,
+                watched_group_ids: &groups,
+                capabilities: &capabilities,
+                primary_address: "kaspa:qexample",
+                aliases: &[],
+                wallet_pubkey: "bb",
+                wallet_address: "kaspa:qexample",
+                timestamp_ms: 1,
+                expires_at_ms: 2,
+            })
+        };
+
+        let legacy = make(AuthPreimageFormat::LegacyV1);
+        assert!(!legacy.contains("watched_group_ids_hash="));
+        assert!(!legacy.contains("capabilities_hash="));
+
+        let transitional = make(AuthPreimageFormat::TransitionalGroups);
+        assert!(transitional.contains("domain=kasia-push-auth:v1"));
+        assert!(transitional.contains("watched_group_ids_hash="));
+        assert!(!transitional.contains("capabilities_hash="));
+
+        let v2 = make(AuthPreimageFormat::V2);
+        assert!(v2.contains("domain=kasia-push-auth:v2\nauth_version=2"));
+        assert!(v2.contains("watched_group_ids_hash="));
+        assert!(v2.contains("capabilities_hash="));
+    }
+
+    #[test]
+    fn watched_group_field_presence_selects_transitional_auth_even_when_empty() {
+        let auth = PushAuthRequest {
+            auth_version: None,
+            wallet_pubkey: String::new(),
+            wallet_address: String::new(),
+            nonce: String::new(),
+            timestamp_ms: 0,
+            expires_at_ms: 0,
+            signature: String::new(),
+            devicecheck_token: None,
+            app_attest_key_id: None,
+            app_attest_attestation: None,
+            app_attest_assertion: None,
+            device_auth: None,
+        };
+
+        assert_eq!(
+            select_auth_format(&auth, None, &[]).expect("legacy format"),
+            AuthPreimageFormat::LegacyV1
+        );
+        assert_eq!(
+            select_auth_format(&auth, Some(&[]), &[]).expect("transitional format"),
+            AuthPreimageFormat::TransitionalGroups
+        );
     }
 
     #[test]

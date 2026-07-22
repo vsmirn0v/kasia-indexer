@@ -46,7 +46,9 @@ Useful commands:
 ## API
 
 - http://localhost:8080/swagger-ui/
-- `GET http://localhost:8080/metrics` exposes Prometheus text metrics.
+- `GET http://localhost:8080/metrics` exposes a JSON metrics snapshot.
+- `GET http://localhost:8080/metrics/prometheus` exposes Prometheus text metrics.
+- See `docs/GROUP_CHAT_API.md` for group-chat wire formats, APIs, push auth, and KaChat integration.
 
 ## Reverse Proxy Hardening
 

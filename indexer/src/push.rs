@@ -1,28 +1,39 @@
 use crate::api::to_rpc_address;
 use crate::config::ApnsEnvironment;
 use crate::context::IndexerContext;
+use futures_util::{StreamExt, stream};
 use indexer_actors::metrics::SharedMetrics;
 use indexer_actors::push::{PushEvent, PushEventKind};
 use indexer_actors::util::ToHex;
 use indexer_db::AddressPayload;
-use indexer_db::push::{DeviceRegistrationPartition, WatchedAddressPartition};
+use indexer_db::push::{
+    DeviceRegistrationPartition, PrimaryAddressPartition, WatchedAddressPartition,
+    WatchedGroupIdPartition,
+};
 use jsonwebtoken::{EncodingKey, Header};
 use kaspa_rpc_core::{RpcAddress, RpcNetworkType};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::mem::size_of;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, oneshot};
 use tracing::{info, warn};
 
 const MAX_WATCHED_ADDRESSES: usize = 256;
+const MAX_WATCHED_GROUP_IDS: usize = 256;
+const MAX_CAPABILITIES: usize = 32;
+const MAX_CAPABILITY_LEN_BYTES: usize = 64;
 const MAX_ALIASES: usize = 256;
 const MAX_ALIAS_LEN_BYTES: usize = 64;
 const MAX_ADDRESS_LEN_BYTES: usize = 128;
 const MAX_PLATFORM_LEN_BYTES: usize = 16;
 const WALLET_PUBKEY_HEX_LEN: usize = 64;
 const SUPPORTED_PLATFORMS: &[&str] = &["ios", "macos"];
+pub const GROUP_V1_CAPABILITY: &str = "group_v1";
 pub const PUSH_REGISTRY_COMMAND_CAPACITY: usize = 256;
+const MAX_PUSH_FANOUT: usize = 512;
+const APNS_SEND_CONCURRENCY: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct WalletBinding {
@@ -41,9 +52,12 @@ pub struct PushRegistry {
     tx_keyspace: fjall::TxKeyspace,
     device_partition: DeviceRegistrationPartition,
     watched_partition: WatchedAddressPartition,
+    watched_group_partition: WatchedGroupIdPartition,
+    primary_address_partition: PrimaryAddressPartition,
     metrics: SharedMetrics,
     alias_cache: HashMap<String, HashSet<String>>,
     primary_cache: HashMap<String, Option<AddressPayload>>,
+    capability_cache: HashMap<String, HashSet<String>>,
 }
 
 impl PushRegistry {
@@ -51,39 +65,58 @@ impl PushRegistry {
         tx_keyspace: fjall::TxKeyspace,
         device_partition: DeviceRegistrationPartition,
         watched_partition: WatchedAddressPartition,
+        watched_group_partition: WatchedGroupIdPartition,
+        primary_address_partition: PrimaryAddressPartition,
         metrics: SharedMetrics,
     ) -> Self {
         Self {
             tx_keyspace,
             device_partition,
             watched_partition,
+            watched_group_partition,
+            primary_address_partition,
             metrics,
             alias_cache: HashMap::new(),
             primary_cache: HashMap::new(),
+            capability_cache: HashMap::new(),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn register(
         &mut self,
         token: String,
         platform: String,
         watched_addresses: Vec<String>,
+        watched_group_ids: Vec<String>,
+        capabilities: Vec<String>,
         primary_address: Option<String>,
         aliases: Vec<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
         self.metrics.increment_push_register_calls_total();
-        validate_registration_limits(&watched_addresses, &aliases)?;
+        validate_registration_limits(
+            &watched_addresses,
+            &watched_group_ids,
+            &capabilities,
+            &aliases,
+        )?;
         let platform = normalize_platform(platform)?;
         let token = normalize_device_token(&token)?;
         let now = unix_time_secs();
         let (addresses, payloads) = normalize_addresses(watched_addresses)?;
+        let (group_ids, group_id_bytes) = normalize_group_ids(watched_group_ids)?;
+        let normalized_capabilities = normalize_capabilities(capabilities)?;
         let normalized_aliases = normalize_aliases_vec(aliases);
         let normalized_alias_set = normalize_aliases(normalized_aliases.clone());
         let normalized_primary_address = normalize_primary_address(primary_address);
-        if addresses.is_empty() {
-            anyhow::bail!("watched_addresses must not be empty");
+        let normalized_primary_payload = normalized_primary_address
+            .as_deref()
+            .map(address_to_payload)
+            .transpose()?;
+        if addresses.is_empty() && group_ids.is_empty() {
+            anyhow::bail!("watched_addresses and watched_group_ids must not both be empty");
         }
 
         let existing = self.get_registration(&token)?;
@@ -113,6 +146,14 @@ impl PushRegistry {
         let addresses_unchanged = existing
             .as_ref()
             .map(|reg| reg.watched_addresses == addresses)
+            .unwrap_or(false);
+        let group_ids_unchanged = existing
+            .as_ref()
+            .map(|reg| reg.watched_group_ids == group_ids)
+            .unwrap_or(false);
+        let capabilities_unchanged = existing
+            .as_ref()
+            .map(|reg| reg.capabilities == normalized_capabilities)
             .unwrap_or(false);
         let platform_unchanged = existing
             .as_ref()
@@ -144,6 +185,8 @@ impl PushRegistry {
             })
             .unwrap_or(false);
         if addresses_unchanged
+            && group_ids_unchanged
+            && capabilities_unchanged
             && platform_unchanged
             && aliases_unchanged
             && primary_unchanged
@@ -155,6 +198,7 @@ impl PushRegistry {
             self.metrics.increment_push_fast_path_skips_total();
             self.update_aliases(&token, normalized_aliases);
             self.update_primary_address(&token, normalized_primary_address);
+            self.update_capabilities(&token, normalized_capabilities);
             return Ok(());
         }
 
@@ -162,6 +206,8 @@ impl PushRegistry {
             device_token: token.clone(),
             platform,
             watched_addresses: addresses,
+            watched_group_ids: group_ids,
+            capabilities: normalized_capabilities.clone(),
             aliases: normalized_aliases.clone(),
             primary_address: normalized_primary_address.clone(),
             wallet_pubkey: effective_wallet_pubkey,
@@ -196,11 +242,11 @@ impl PushRegistry {
                     .map(|addr| addr.as_str())
                     .collect();
                 for address in &existing.watched_addresses {
-                    if !new_set.contains(address.as_str()) {
-                        if let Ok(payload) = address_to_payload(address) {
-                            self.watched_partition
-                                .remove_wtx(&mut wtx, &payload, token_key);
-                        }
+                    if !new_set.contains(address.as_str())
+                        && let Ok(payload) = address_to_payload(address)
+                    {
+                        self.watched_partition
+                            .remove_wtx(&mut wtx, &payload, token_key);
                     }
                 }
                 for (address, payload) in registration.watched_addresses.iter().zip(payloads.iter())
@@ -211,10 +257,62 @@ impl PushRegistry {
                     }
                 }
             }
+            if !group_ids_unchanged {
+                let new_set: HashSet<&str> = registration
+                    .watched_group_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                let old_set: HashSet<&str> = existing
+                    .watched_group_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                for group_id in &existing.watched_group_ids {
+                    if !new_set.contains(group_id.as_str())
+                        && let Ok(bytes) = decode_group_id_hex(group_id)
+                    {
+                        self.watched_group_partition
+                            .remove_wtx(&mut wtx, &bytes, token_key);
+                    }
+                }
+                for (group_id, bytes) in registration
+                    .watched_group_ids
+                    .iter()
+                    .zip(group_id_bytes.iter())
+                {
+                    if !old_set.contains(group_id.as_str()) {
+                        self.watched_group_partition
+                            .insert_wtx(&mut wtx, bytes, token_key);
+                    }
+                }
+            }
+            if !primary_unchanged {
+                if let Some(old_primary) = existing
+                    .primary_address
+                    .as_deref()
+                    .and_then(|address| address_to_payload(address).ok())
+                {
+                    self.primary_address_partition
+                        .remove_wtx(&mut wtx, &old_primary, token_key);
+                }
+                if let Some(primary) = normalized_primary_payload {
+                    self.primary_address_partition
+                        .insert_wtx(&mut wtx, &primary, token_key);
+                }
+            }
         } else {
             for payload in payloads {
                 self.watched_partition
                     .insert_wtx(&mut wtx, &payload, token_key);
+            }
+            for group_id in &group_id_bytes {
+                self.watched_group_partition
+                    .insert_wtx(&mut wtx, group_id, token_key);
+            }
+            if let Some(primary) = normalized_primary_payload {
+                self.primary_address_partition
+                    .insert_wtx(&mut wtx, &primary, token_key);
             }
         }
         self.device_partition
@@ -226,6 +324,7 @@ impl PushRegistry {
             Ok(result) if result.is_ok() => {
                 self.update_aliases(&token, normalized_aliases);
                 self.update_primary_address(&token, normalized_primary_address);
+                self.update_capabilities(&token, normalized_capabilities);
                 if !had_existing {
                     self.metrics.increment_push_registered_devices(1);
                 }
@@ -243,25 +342,39 @@ impl PushRegistry {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         token: String,
         watched_addresses: Vec<String>,
+        watched_group_ids: Vec<String>,
+        capabilities: Vec<String>,
         primary_address: Option<String>,
         aliases: Vec<String>,
         wallet_binding: Option<WalletBinding>,
         device_key_binding: Option<DeviceKeyBinding>,
     ) -> anyhow::Result<()> {
         self.metrics.increment_push_update_calls_total();
-        validate_registration_limits(&watched_addresses, &aliases)?;
+        validate_registration_limits(
+            &watched_addresses,
+            &watched_group_ids,
+            &capabilities,
+            &aliases,
+        )?;
         let token = normalize_device_token(&token)?;
         let now = unix_time_secs();
         let (addresses, payloads) = normalize_addresses(watched_addresses)?;
+        let (group_ids, group_id_bytes) = normalize_group_ids(watched_group_ids)?;
+        let normalized_capabilities = normalize_capabilities(capabilities)?;
         let normalized_aliases = normalize_aliases_vec(aliases);
         let normalized_alias_set = normalize_aliases(normalized_aliases.clone());
         let normalized_primary_address = normalize_primary_address(primary_address);
-        if addresses.is_empty() {
-            anyhow::bail!("watched_addresses must not be empty");
+        let normalized_primary_payload = normalized_primary_address
+            .as_deref()
+            .map(address_to_payload)
+            .transpose()?;
+        if addresses.is_empty() && group_ids.is_empty() {
+            anyhow::bail!("watched_addresses and watched_group_ids must not both be empty");
         }
 
         let existing = self.get_registration(&token)?;
@@ -296,6 +409,14 @@ impl PushRegistry {
             .as_ref()
             .map(|reg| reg.watched_addresses == addresses)
             .unwrap_or(false);
+        let group_ids_unchanged = existing
+            .as_ref()
+            .map(|reg| reg.watched_group_ids == group_ids)
+            .unwrap_or(false);
+        let capabilities_unchanged = existing
+            .as_ref()
+            .map(|reg| reg.capabilities == normalized_capabilities)
+            .unwrap_or(false);
         let aliases_unchanged = existing
             .as_ref()
             .map(|reg| normalize_aliases(reg.aliases.clone()) == normalized_alias_set)
@@ -322,6 +443,8 @@ impl PushRegistry {
             })
             .unwrap_or(false);
         if addresses_unchanged
+            && group_ids_unchanged
+            && capabilities_unchanged
             && aliases_unchanged
             && primary_unchanged
             && wallet_binding_unchanged
@@ -331,6 +454,7 @@ impl PushRegistry {
             self.metrics.increment_push_fast_path_skips_total();
             self.update_aliases(&token, normalized_aliases);
             self.update_primary_address(&token, normalized_primary_address);
+            self.update_capabilities(&token, normalized_capabilities);
             return Ok(());
         }
 
@@ -338,6 +462,8 @@ impl PushRegistry {
             device_token: token.clone(),
             platform,
             watched_addresses: addresses,
+            watched_group_ids: group_ids,
+            capabilities: normalized_capabilities.clone(),
             aliases: normalized_aliases.clone(),
             primary_address: normalized_primary_address.clone(),
             wallet_pubkey: effective_wallet_pubkey,
@@ -372,11 +498,11 @@ impl PushRegistry {
                     .map(|addr| addr.as_str())
                     .collect();
                 for address in &existing.watched_addresses {
-                    if !new_set.contains(address.as_str()) {
-                        if let Ok(payload) = address_to_payload(address) {
-                            self.watched_partition
-                                .remove_wtx(&mut wtx, &payload, token_key);
-                        }
+                    if !new_set.contains(address.as_str())
+                        && let Ok(payload) = address_to_payload(address)
+                    {
+                        self.watched_partition
+                            .remove_wtx(&mut wtx, &payload, token_key);
                     }
                 }
                 for (address, payload) in registration.watched_addresses.iter().zip(payloads.iter())
@@ -387,10 +513,62 @@ impl PushRegistry {
                     }
                 }
             }
+            if !group_ids_unchanged {
+                let new_set: HashSet<&str> = registration
+                    .watched_group_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                let old_set: HashSet<&str> = existing
+                    .watched_group_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                for group_id in &existing.watched_group_ids {
+                    if !new_set.contains(group_id.as_str())
+                        && let Ok(bytes) = decode_group_id_hex(group_id)
+                    {
+                        self.watched_group_partition
+                            .remove_wtx(&mut wtx, &bytes, token_key);
+                    }
+                }
+                for (group_id, bytes) in registration
+                    .watched_group_ids
+                    .iter()
+                    .zip(group_id_bytes.iter())
+                {
+                    if !old_set.contains(group_id.as_str()) {
+                        self.watched_group_partition
+                            .insert_wtx(&mut wtx, bytes, token_key);
+                    }
+                }
+            }
+            if !primary_unchanged {
+                if let Some(old_primary) = existing
+                    .primary_address
+                    .as_deref()
+                    .and_then(|address| address_to_payload(address).ok())
+                {
+                    self.primary_address_partition
+                        .remove_wtx(&mut wtx, &old_primary, token_key);
+                }
+                if let Some(primary) = normalized_primary_payload {
+                    self.primary_address_partition
+                        .insert_wtx(&mut wtx, &primary, token_key);
+                }
+            }
         } else {
             for payload in payloads {
                 self.watched_partition
                     .insert_wtx(&mut wtx, &payload, token_key);
+            }
+            for group_id in &group_id_bytes {
+                self.watched_group_partition
+                    .insert_wtx(&mut wtx, group_id, token_key);
+            }
+            if let Some(primary) = normalized_primary_payload {
+                self.primary_address_partition
+                    .insert_wtx(&mut wtx, &primary, token_key);
             }
         }
         self.device_partition
@@ -402,6 +580,7 @@ impl PushRegistry {
             Ok(result) if result.is_ok() => {
                 self.update_aliases(&token, normalized_aliases);
                 self.update_primary_address(&token, normalized_primary_address);
+                self.update_capabilities(&token, normalized_capabilities);
                 if !had_existing {
                     self.metrics.increment_push_registered_devices(1);
                 }
@@ -444,6 +623,20 @@ impl PushRegistry {
                         .remove_wtx(&mut wtx, &payload, token_key);
                 }
             }
+            for group_id in existing.watched_group_ids {
+                if let Ok(group_id) = decode_group_id_hex(&group_id) {
+                    self.watched_group_partition
+                        .remove_wtx(&mut wtx, &group_id, token_key);
+                }
+            }
+            if let Some(primary) = existing
+                .primary_address
+                .as_deref()
+                .and_then(|address| address_to_payload(address).ok())
+            {
+                self.primary_address_partition
+                    .remove_wtx(&mut wtx, &primary, token_key);
+            }
         }
         self.device_partition.remove_wtx(&mut wtx, token.as_bytes());
         let commit = wtx.commit();
@@ -453,6 +646,7 @@ impl PushRegistry {
             Ok(result) if result.is_ok() => {
                 self.clear_aliases(&token);
                 self.clear_primary_address(&token);
+                self.clear_capabilities(&token);
                 if had_existing {
                     self.metrics.decrement_push_registered_devices(1);
                 }
@@ -511,7 +705,7 @@ impl PushRegistry {
     pub fn tokens_for_address(&self, address: &AddressPayload) -> anyhow::Result<Vec<String>> {
         self.metrics.increment_db_read_ops_total(1);
         let db_read_started = Instant::now();
-        let result = (|| {
+        let result: anyhow::Result<Vec<String>> = (|| {
             let rtx = self.tx_keyspace.read_tx();
             let mut tokens = Vec::new();
             for entry in self.watched_partition.get_by_address_prefix(&rtx, address) {
@@ -522,6 +716,53 @@ impl PushRegistry {
             }
             Ok(tokens)
         })();
+        self.metrics
+            .increment_db_read_time_ms_total(elapsed_ms_u64(db_read_started));
+        if result.is_err() {
+            self.metrics.increment_db_errors_total();
+        }
+        result
+    }
+
+    pub fn tokens_for_group(&self, group_id: &[u8; 32]) -> anyhow::Result<Vec<String>> {
+        self.metrics.increment_db_read_ops_total(1);
+        let db_read_started = Instant::now();
+        let result: anyhow::Result<Vec<String>> = {
+            let rtx = self.tx_keyspace.read_tx();
+            self.watched_group_partition
+                .get_by_group_id_prefix(&rtx, group_id)
+                .map(|entry| {
+                    let key = entry?;
+                    token_from_index_key(key.as_ref(), group_id.len())
+                        .ok_or_else(|| anyhow::anyhow!("Invalid group watcher index key"))
+                })
+                .collect()
+        };
+        self.metrics
+            .increment_db_read_time_ms_total(elapsed_ms_u64(db_read_started));
+        if result.is_err() {
+            self.metrics.increment_db_errors_total();
+        }
+        result
+    }
+
+    pub fn tokens_for_primary_address(
+        &self,
+        address: &AddressPayload,
+    ) -> anyhow::Result<Vec<String>> {
+        self.metrics.increment_db_read_ops_total(1);
+        let db_read_started = Instant::now();
+        let result: anyhow::Result<Vec<String>> = {
+            let rtx = self.tx_keyspace.read_tx();
+            self.primary_address_partition
+                .get_by_address_prefix(&rtx, address)
+                .map(|entry| {
+                    let key = entry?;
+                    token_from_index_key(key.as_ref(), size_of::<AddressPayload>())
+                        .ok_or_else(|| anyhow::anyhow!("Invalid primary address index key"))
+                })
+                .collect()
+        };
         self.metrics
             .increment_db_read_time_ms_total(elapsed_ms_u64(db_read_started));
         if result.is_err() {
@@ -625,6 +866,16 @@ impl PushRegistry {
         }
     }
 
+    fn token_has_capability(&mut self, token: &str, capability: &str) -> bool {
+        if let Some(capabilities) = self.capability_cache.get(token) {
+            return capabilities.contains(capability);
+        }
+        self.hydrate_filter_caches(token);
+        self.capability_cache
+            .get(token)
+            .is_some_and(|capabilities| capabilities.contains(capability))
+    }
+
     fn update_aliases(&mut self, token: &str, aliases: Vec<String>) {
         let normalized = normalize_aliases(aliases);
         // Keep empty set as an explicit "allow all aliases" marker to avoid DB re-hydration loops.
@@ -645,6 +896,15 @@ impl PushRegistry {
         self.primary_cache.remove(token);
     }
 
+    fn update_capabilities(&mut self, token: &str, capabilities: Vec<String>) {
+        self.capability_cache
+            .insert(token.to_string(), capabilities.into_iter().collect());
+    }
+
+    fn clear_capabilities(&mut self, token: &str) {
+        self.capability_cache.remove(token);
+    }
+
     pub fn metrics(&self) -> SharedMetrics {
         self.metrics.clone()
     }
@@ -655,6 +915,7 @@ impl PushRegistry {
         };
         self.update_aliases(token, registration.aliases);
         self.update_primary_address(token, registration.primary_address);
+        self.update_capabilities(token, registration.capabilities);
     }
 
     fn matching_tokens(
@@ -686,6 +947,33 @@ impl PushRegistry {
         }
         Ok(matching)
     }
+
+    fn matching_tokens_for_group(&mut self, group_id: &[u8; 32]) -> anyhow::Result<Vec<String>> {
+        let tokens = self.tokens_for_group(group_id)?;
+        self.metrics
+            .increment_push_tokens_looked_up_total(tokens.len() as u64);
+        Ok(tokens
+            .into_iter()
+            .filter(|token| self.token_has_capability(token, GROUP_V1_CAPABILITY))
+            .collect())
+    }
+
+    fn matching_tokens_for_group_control(
+        &mut self,
+        sender: &AddressPayload,
+        recipient: Option<&AddressPayload>,
+    ) -> anyhow::Result<Vec<String>> {
+        let tokens = match recipient {
+            Some(recipient) => self.tokens_for_primary_address(recipient)?,
+            None => self.tokens_for_address(sender)?,
+        };
+        self.metrics
+            .increment_push_tokens_looked_up_total(tokens.len() as u64);
+        Ok(tokens
+            .into_iter()
+            .filter(|token| self.token_has_capability(token, GROUP_V1_CAPABILITY))
+            .collect())
+    }
 }
 
 type RegistryResponse<T> = oneshot::Sender<anyhow::Result<T>>;
@@ -695,6 +983,8 @@ enum PushRegistryCommand {
         token: String,
         platform: String,
         watched_addresses: Vec<String>,
+        watched_group_ids: Vec<String>,
+        capabilities: Vec<String>,
         primary_address: Option<String>,
         aliases: Vec<String>,
         wallet_binding: Option<WalletBinding>,
@@ -704,6 +994,8 @@ enum PushRegistryCommand {
     Update {
         token: String,
         watched_addresses: Vec<String>,
+        watched_group_ids: Vec<String>,
+        capabilities: Vec<String>,
         primary_address: Option<String>,
         aliases: Vec<String>,
         wallet_binding: Option<WalletBinding>,
@@ -724,6 +1016,15 @@ enum PushRegistryCommand {
         watched_address: AddressPayload,
         alias: Option<String>,
         receiver: Option<AddressPayload>,
+        response: RegistryResponse<Vec<String>>,
+    },
+    MatchGroupTokens {
+        group_id: [u8; 32],
+        response: RegistryResponse<Vec<String>>,
+    },
+    MatchGroupControlTokens {
+        sender: AddressPayload,
+        recipient: Option<AddressPayload>,
         response: RegistryResponse<Vec<String>>,
     },
 }
@@ -754,6 +1055,8 @@ impl PushRegistryActor {
                     token,
                     platform,
                     watched_addresses,
+                    watched_group_ids,
+                    capabilities,
                     primary_address,
                     aliases,
                     wallet_binding,
@@ -764,6 +1067,8 @@ impl PushRegistryActor {
                         token,
                         platform,
                         watched_addresses,
+                        watched_group_ids,
+                        capabilities,
                         primary_address,
                         aliases,
                         wallet_binding,
@@ -774,6 +1079,8 @@ impl PushRegistryActor {
                 PushRegistryCommand::Update {
                     token,
                     watched_addresses,
+                    watched_group_ids,
+                    capabilities,
                     primary_address,
                     aliases,
                     wallet_binding,
@@ -783,6 +1090,8 @@ impl PushRegistryActor {
                     let result = self.registry.update(
                         token,
                         watched_addresses,
+                        watched_group_ids,
+                        capabilities,
                         primary_address,
                         aliases,
                         wallet_binding,
@@ -820,6 +1129,20 @@ impl PushRegistryActor {
                     );
                     let _ = response.send(result);
                 }
+                PushRegistryCommand::MatchGroupTokens { group_id, response } => {
+                    let result = self.registry.matching_tokens_for_group(&group_id);
+                    let _ = response.send(result);
+                }
+                PushRegistryCommand::MatchGroupControlTokens {
+                    sender,
+                    recipient,
+                    response,
+                } => {
+                    let result = self
+                        .registry
+                        .matching_tokens_for_group_control(&sender, recipient.as_ref());
+                    let _ = response.send(result);
+                }
             }
         }
         info!("[PushRegistry] actor stopped");
@@ -847,11 +1170,14 @@ impl PushRegistryHandle {
             .map_err(|_| anyhow::anyhow!("push registry actor dropped its response"))?
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn register(
         &self,
         token: String,
         platform: String,
         watched_addresses: Vec<String>,
+        watched_group_ids: Vec<String>,
+        capabilities: Vec<String>,
         primary_address: Option<String>,
         aliases: Vec<String>,
         wallet_binding: Option<WalletBinding>,
@@ -861,6 +1187,8 @@ impl PushRegistryHandle {
             token,
             platform,
             watched_addresses,
+            watched_group_ids,
+            capabilities,
             primary_address,
             aliases,
             wallet_binding,
@@ -870,10 +1198,13 @@ impl PushRegistryHandle {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update(
         &self,
         token: String,
         watched_addresses: Vec<String>,
+        watched_group_ids: Vec<String>,
+        capabilities: Vec<String>,
         primary_address: Option<String>,
         aliases: Vec<String>,
         wallet_binding: Option<WalletBinding>,
@@ -882,6 +1213,8 @@ impl PushRegistryHandle {
         self.request(|response| PushRegistryCommand::Update {
             token,
             watched_addresses,
+            watched_group_ids,
+            capabilities,
             primary_address,
             aliases,
             wallet_binding,
@@ -926,6 +1259,27 @@ impl PushRegistryHandle {
         .await
     }
 
+    pub async fn matching_tokens_for_group(
+        &self,
+        group_id: [u8; 32],
+    ) -> anyhow::Result<Vec<String>> {
+        self.request(|response| PushRegistryCommand::MatchGroupTokens { group_id, response })
+            .await
+    }
+
+    pub async fn matching_tokens_for_group_control(
+        &self,
+        sender: AddressPayload,
+        recipient: Option<AddressPayload>,
+    ) -> anyhow::Result<Vec<String>> {
+        self.request(|response| PushRegistryCommand::MatchGroupControlTokens {
+            sender,
+            recipient,
+            response,
+        })
+        .await
+    }
+
     pub fn metrics(&self) -> SharedMetrics {
         self.metrics.clone()
     }
@@ -936,6 +1290,10 @@ pub struct DeviceRegistration {
     pub device_token: String,
     pub platform: String,
     pub watched_addresses: Vec<String>,
+    #[serde(default)]
+    pub watched_group_ids: Vec<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     #[serde(default)]
     pub aliases: Vec<String>,
     #[serde(default)]
@@ -988,7 +1346,7 @@ impl PushDispatcher {
             metrics: registry.metrics(),
             registry,
             apns,
-            network_type: context.network_type.into(),
+            network_type: context.network_type,
             sent_cache: SentTxCache::new(Duration::from_secs(60)),
             invalid_token_counts: HashMap::new(),
         }
@@ -1012,27 +1370,51 @@ impl PushDispatcher {
             None => return Ok(()),
         };
 
+        let mut tokens = match event.kind {
+            PushEventKind::GroupMessage => {
+                let Some(group_id) = event.blinded_group_id else {
+                    return Ok(());
+                };
+                self.registry.matching_tokens_for_group(group_id).await?
+            }
+            PushEventKind::GroupControl => {
+                self.registry
+                    .matching_tokens_for_group_control(
+                        event.watched_address,
+                        event.group_control_recipient,
+                    )
+                    .await?
+            }
+            _ => {
+                let receiver_filter = matches!(
+                    event.kind,
+                    PushEventKind::Payment | PushEventKind::Handshake
+                )
+                .then_some(event.receiver);
+                self.registry
+                    .matching_tokens(event.watched_address, event.alias.clone(), receiver_filter)
+                    .await?
+            }
+        };
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        tokens.sort_unstable();
+        tokens.dedup();
+        if tokens.len() > MAX_PUSH_FANOUT {
+            warn!(
+                token_count = tokens.len(),
+                max_fanout = MAX_PUSH_FANOUT,
+                "Truncating push fanout"
+            );
+            tokens.truncate(MAX_PUSH_FANOUT);
+        }
+
         let sender_addr = to_rpc_address(&event.sender, self.network_type)?;
         let Some(sender_addr) = sender_addr else {
             return Ok(());
         };
         let sender = sender_addr.to_string();
-
-        let receiver_filter = if matches!(
-            event.kind,
-            PushEventKind::Payment | PushEventKind::Handshake
-        ) {
-            Some(event.receiver)
-        } else {
-            None
-        };
-        let tokens = self
-            .registry
-            .matching_tokens(event.watched_address, event.alias.clone(), receiver_filter)
-            .await?;
-        if tokens.is_empty() {
-            return Ok(());
-        }
 
         let tx_id = event.tx_id.to_hex();
         if !self.sent_cache.mark_seen(&tx_id) {
@@ -1045,6 +1427,8 @@ impl PushDispatcher {
             PushEventKind::Payment => "payment",
             PushEventKind::Handshake => "handshake",
             PushEventKind::SelfStash => "contextual",
+            PushEventKind::GroupMessage => "group_message",
+            PushEventKind::GroupControl => "group_control",
         };
         let watched_addr = to_rpc_address(&event.watched_address, self.network_type)?
             .map(|addr| addr.to_string())
@@ -1053,7 +1437,7 @@ impl PushDispatcher {
         let payload_included = event
             .payload
             .as_ref()
-            .map(|p| p.as_bytes().len() <= MAX_PUSH_PAYLOAD_BYTES)
+            .map(|p| p.len() <= MAX_PUSH_PAYLOAD_BYTES)
             .unwrap_or(false);
         info!(
             "[Push] event type={} sender={} watched={} tx={} tokens={} payload_len={} payload_included={}",
@@ -1079,13 +1463,25 @@ impl PushDispatcher {
             payload: event.payload.and_then(payload_within_limit),
             timestamp: event.timestamp,
             daa_score: event.daa_score,
+            blinded_group_id: event.blinded_group_id.map(|id| id.to_hex()),
         };
 
-        for token in tokens {
+        let results = stream::iter(tokens.into_iter().map(|token| {
+            let payload = &payload;
+            async move {
+                let result = apns.send(&token, payload).await;
+                (token, result)
+            }
+        }))
+        .buffer_unordered(APNS_SEND_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+        for (token, result) in results {
             let token_short = token
                 .get(token.len().saturating_sub(8)..)
                 .unwrap_or(token.as_str());
-            match apns.send(&token, &payload).await {
+            match result {
                 Ok(()) => {
                     info!("[Push] Delivered to ...{}", token_short);
                     self.metrics.increment_push_sent_ok_total();
@@ -1148,6 +1544,8 @@ struct PushPayload {
     payload: Option<String>,
     timestamp: u64,
     daa_score: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blinded_group_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1171,6 +1569,8 @@ impl PushAlert {
         let body = match payload_type {
             "payment" => "Payment received".to_string(),
             "handshake" => "Started a conversation".to_string(),
+            "group_message" => "New group message".to_string(),
+            "group_control" => "Group update".to_string(),
             _ => "New message".to_string(),
         };
         Self { title, body }
@@ -1180,7 +1580,7 @@ impl PushAlert {
 const MAX_PUSH_PAYLOAD_BYTES: usize = 3_500;
 
 fn payload_within_limit(payload: String) -> Option<String> {
-    if payload.as_bytes().len() <= MAX_PUSH_PAYLOAD_BYTES {
+    if payload.len() <= MAX_PUSH_PAYLOAD_BYTES {
         Some(payload)
     } else {
         None
@@ -1313,10 +1713,10 @@ impl ApnsClient {
     async fn auth_token(&self) -> anyhow::Result<String> {
         let mut cache = self.auth_cache.lock().await;
         let now = unix_time_secs();
-        if let Some(cache) = cache.as_ref() {
-            if now.saturating_sub(cache.issued_at) < 50 * 60 {
-                return Ok(cache.token.clone());
-            }
+        if let Some(cache) = cache.as_ref()
+            && now.saturating_sub(cache.issued_at) < 50 * 60
+        {
+            return Ok(cache.token.clone());
         }
 
         let header = Header {
@@ -1380,7 +1780,7 @@ impl ApnsClient {
 fn normalize_device_token(token: &str) -> anyhow::Result<String> {
     let cleaned: String = token.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     // APNs treats the token as opaque; length may vary across environments/devices.
-    if cleaned.len() < 64 || cleaned.len() > 512 || cleaned.len() % 2 != 0 {
+    if cleaned.len() < 64 || cleaned.len() > 512 || !cleaned.len().is_multiple_of(2) {
         anyhow::bail!("Invalid device token length");
     }
     Ok(cleaned.to_lowercase())
@@ -1402,6 +1802,8 @@ fn normalize_platform(platform: String) -> anyhow::Result<String> {
 
 fn validate_registration_limits(
     watched_addresses: &[String],
+    watched_group_ids: &[String],
+    capabilities: &[String],
     aliases: &[String],
 ) -> anyhow::Result<()> {
     if watched_addresses.len() > MAX_WATCHED_ADDRESSES {
@@ -1411,8 +1813,27 @@ fn validate_registration_limits(
             MAX_WATCHED_ADDRESSES
         );
     }
+    if watched_group_ids.len() > MAX_WATCHED_GROUP_IDS {
+        anyhow::bail!(
+            "Too many watched group ids: {} (max {})",
+            watched_group_ids.len(),
+            MAX_WATCHED_GROUP_IDS
+        );
+    }
+    if capabilities.len() > MAX_CAPABILITIES {
+        anyhow::bail!(
+            "Too many capabilities: {} (max {})",
+            capabilities.len(),
+            MAX_CAPABILITIES
+        );
+    }
     if aliases.len() > MAX_ALIASES {
         anyhow::bail!("Too many aliases: {} (max {})", aliases.len(), MAX_ALIASES);
+    }
+    for capability in capabilities {
+        if capability.trim().len() > MAX_CAPABILITY_LEN_BYTES {
+            anyhow::bail!("Capability is too long");
+        }
     }
     for address in watched_addresses {
         let trimmed = address.trim();
@@ -1574,16 +1995,68 @@ fn device_binding_matches_registration(
 }
 
 fn token_from_watched_key_bytes(key: &[u8]) -> Option<String> {
-    let address_prefix_len = std::mem::size_of::<AddressPayload>();
-    if key.len() <= address_prefix_len {
+    token_from_index_key(key, size_of::<AddressPayload>())
+}
+
+fn token_from_index_key(key: &[u8], prefix_len: usize) -> Option<String> {
+    if key.len() <= prefix_len {
         return None;
     }
-    let token_bytes = &key[address_prefix_len..];
+    let token_bytes = &key[prefix_len..];
     if !token_bytes.iter().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let token = std::str::from_utf8(token_bytes).ok()?;
     Some(token.to_ascii_lowercase())
+}
+
+fn decode_group_id_hex(value: &str) -> anyhow::Result<[u8; 32]> {
+    let normalized = value.trim();
+    if normalized.len() != 64 {
+        anyhow::bail!("blinded group id must be 32-byte hex");
+    }
+    let mut bytes = [0u8; 32];
+    faster_hex::hex_decode(normalized.as_bytes(), &mut bytes)
+        .map_err(|err| anyhow::anyhow!("invalid blinded group id: {err}"))?;
+    Ok(bytes)
+}
+
+fn normalize_group_ids(values: Vec<String>) -> anyhow::Result<(Vec<String>, Vec<[u8; 32]>)> {
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+    let mut decoded = Vec::new();
+    for value in values {
+        let value = value.trim().to_ascii_lowercase();
+        let bytes = decode_group_id_hex(&value)?;
+        if seen.insert(value.clone()) {
+            normalized.push(value);
+            decoded.push(bytes);
+        }
+    }
+    Ok((normalized, decoded))
+}
+
+fn normalize_capabilities(values: Vec<String>) -> anyhow::Result<Vec<String>> {
+    let mut capabilities = HashSet::new();
+    for value in values {
+        let value = value.trim().to_ascii_lowercase();
+        if value.is_empty() {
+            continue;
+        }
+        if value.len() > MAX_CAPABILITY_LEN_BYTES
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'_' | b'-' | b'.')
+            })
+        {
+            anyhow::bail!("Invalid capability");
+        }
+        capabilities.insert(value);
+    }
+    let mut capabilities: Vec<_> = capabilities.into_iter().collect();
+    capabilities.sort_unstable();
+    Ok(capabilities)
 }
 
 fn normalize_addresses(
@@ -1625,9 +2098,7 @@ fn normalize_aliases_vec(aliases: Vec<String>) -> Vec<String> {
 }
 
 fn normalize_primary_address(address: Option<String>) -> Option<String> {
-    let Some(address) = address else {
-        return None;
-    };
+    let address = address?;
     RpcAddress::try_from(address.trim())
         .ok()
         .map(|rpc| rpc.to_string())
@@ -1661,7 +2132,7 @@ fn last_seen_refresh_jitter_secs(token: &str, last_seen: u64) -> u64 {
 
 fn address_to_payload(address: &str) -> anyhow::Result<AddressPayload> {
     let rpc = RpcAddress::try_from(address)?;
-    AddressPayload::try_from(&rpc).map_err(anyhow::Error::from)
+    AddressPayload::try_from(&rpc)
 }
 
 fn load_apns_key(
@@ -1687,13 +2158,16 @@ fn unix_time_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeviceRegistration, MAX_ADDRESS_LEN_BYTES, MAX_ALIAS_LEN_BYTES, MAX_ALIASES,
-        MAX_WATCHED_ADDRESSES, PushRegistry, PushRegistryActor, WalletBinding, address_to_payload,
-        normalize_platform, normalize_wallet_pubkey, resolve_wallet_binding,
+        DeviceRegistration, GROUP_V1_CAPABILITY, MAX_ADDRESS_LEN_BYTES, MAX_ALIAS_LEN_BYTES,
+        MAX_ALIASES, MAX_WATCHED_ADDRESSES, PushRegistry, PushRegistryActor, WalletBinding,
+        address_to_payload, normalize_platform, normalize_wallet_pubkey, resolve_wallet_binding,
         validate_registration_limits,
     };
     use indexer_actors::metrics::create_shared_metrics;
-    use indexer_db::push::{DeviceRegistrationPartition, WatchedAddressPartition};
+    use indexer_db::push::{
+        DeviceRegistrationPartition, PrimaryAddressPartition, WatchedAddressPartition,
+        WatchedGroupIdPartition,
+    };
     use kaspa_addresses::{Address, Prefix, Version};
 
     #[test]
@@ -1718,16 +2192,16 @@ mod tests {
     fn validate_registration_limits_rejects_large_vectors() {
         let addresses = vec!["a".to_string(); MAX_WATCHED_ADDRESSES + 1];
         let aliases = vec!["b".to_string(); MAX_ALIASES + 1];
-        assert!(validate_registration_limits(&addresses, &Vec::<String>::new()).is_err());
-        assert!(validate_registration_limits(&Vec::<String>::new(), &aliases).is_err());
+        assert!(validate_registration_limits(&addresses, &[], &[], &[]).is_err());
+        assert!(validate_registration_limits(&[], &[], &[], &aliases).is_err());
     }
 
     #[test]
     fn validate_registration_limits_rejects_oversized_entries() {
         let long_address = "a".repeat(MAX_ADDRESS_LEN_BYTES + 1);
         let long_alias = "b".repeat(MAX_ALIAS_LEN_BYTES + 1);
-        assert!(validate_registration_limits(&[long_address], &Vec::<String>::new()).is_err());
-        assert!(validate_registration_limits(&Vec::<String>::new(), &[long_alias]).is_err());
+        assert!(validate_registration_limits(&[long_address], &[], &[], &[]).is_err());
+        assert!(validate_registration_limits(&[], &[], &[], &[long_alias]).is_err());
     }
 
     #[test]
@@ -1745,6 +2219,8 @@ mod tests {
             device_token: "token".to_string(),
             platform: "ios".to_string(),
             watched_addresses: vec![],
+            watched_group_ids: vec![],
+            capabilities: vec![],
             aliases: vec![],
             primary_address: None,
             wallet_pubkey: Some("a".repeat(64)),
@@ -1787,6 +2263,8 @@ mod tests {
             tx_keyspace.clone(),
             DeviceRegistrationPartition::new(&tx_keyspace).expect("device partition"),
             WatchedAddressPartition::new(&tx_keyspace).expect("watched partition"),
+            WatchedGroupIdPartition::new(&tx_keyspace).expect("group partition"),
+            PrimaryAddressPartition::new(&tx_keyspace).expect("primary partition"),
             create_shared_metrics(),
         );
         let (actor, handle) = PushRegistryActor::new(registry, 8);
@@ -1796,12 +2274,16 @@ mod tests {
         let watched_payload =
             address_to_payload(&watched_address).expect("valid watched address payload");
         let token = "ab".repeat(32);
+        let group_id = [9u8; 32];
+        let group_id_hex = faster_hex::hex_string(&group_id);
 
         handle
             .register(
                 token.clone(),
                 "ios".to_string(),
                 vec![watched_address.clone()],
+                vec![group_id_hex.clone()],
+                vec![GROUP_V1_CAPABILITY.to_string()],
                 Some(watched_address.clone()),
                 vec!["alice".to_string()],
                 None,
@@ -1819,11 +2301,27 @@ mod tests {
             .await
             .expect("filter succeeds");
         assert_eq!(matching, vec![token.clone()]);
+        assert_eq!(
+            handle
+                .matching_tokens_for_group(group_id)
+                .await
+                .expect("group filter succeeds"),
+            vec![token.clone()]
+        );
+        assert_eq!(
+            handle
+                .matching_tokens_for_group_control(watched_payload, Some(watched_payload))
+                .await
+                .expect("recipient filter succeeds"),
+            vec![token.clone()]
+        );
 
         handle
             .update(
                 token.clone(),
                 vec![watched_address.clone()],
+                vec![group_id_hex],
+                vec![GROUP_V1_CAPABILITY.to_string()],
                 Some(watched_address),
                 vec!["bob".to_string()],
                 None,

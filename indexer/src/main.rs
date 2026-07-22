@@ -20,11 +20,10 @@ use indexer_db::messages::contextual_message::{
     ContextualMessageBySenderPartition, TxIdToContextualMessagePartition,
 };
 use indexer_db::messages::group_control::{
-    GroupControlBySenderPartition, TxIdToGroupControlPartition,
+    GroupControlByRecipientPartition, GroupControlBySenderPartition, TxIdToGroupControlPartition,
 };
-use indexer_db::messages::group_invite::{GroupInviteByTagPartition, TxIdToGroupInvitePartition};
 use indexer_db::messages::group_message::{
-    GroupMessageByBlindedGroupIdPartition, TxIdToGroupMessagePartition,
+    GroupMessageByBlindedGroupIdPartition, GroupSenderBindingPartition, TxIdToGroupMessagePartition,
 };
 use indexer_db::messages::handshake::{
     HandshakeByReceiverPartition, HandshakeBySenderPartition, TxIdToHandshakePartition,
@@ -38,7 +37,10 @@ use indexer_db::migration::apply_migrations;
 use indexer_db::processing::accepting_block_to_txs::AcceptingBlockToTxIDPartition;
 use indexer_db::processing::pending_senders::PendingSenderResolutionPartition;
 use indexer_db::processing::tx_id_to_acceptance::TxIDToAcceptancePartition;
-use indexer_db::push::{DeviceRegistrationPartition, WatchedAddressPartition};
+use indexer_db::push::{
+    DeviceRegistrationPartition, PrimaryAddressPartition, WatchedAddressPartition,
+    WatchedGroupIdPartition,
+};
 use kaspa_rpc_core::RpcBlueWorkType;
 use kaspa_wrpc_client::client::{ConnectOptions, ConnectStrategy};
 use kaspa_wrpc_client::prelude::NetworkType;
@@ -94,9 +96,9 @@ async fn main() -> anyhow::Result<()> {
     let group_message_by_blinded_group_id_partition =
         GroupMessageByBlindedGroupIdPartition::new(&tx_keyspace)?;
     let tx_id_to_group_message_partition = TxIdToGroupMessagePartition::new(&tx_keyspace)?;
-    let group_invite_by_tag_partition = GroupInviteByTagPartition::new(&tx_keyspace)?;
-    let tx_id_to_group_invite_partition = TxIdToGroupInvitePartition::new(&tx_keyspace)?;
+    let group_sender_binding_partition = GroupSenderBindingPartition::new(&tx_keyspace)?;
     let group_control_by_sender_partition = GroupControlBySenderPartition::new(&tx_keyspace)?;
+    let group_control_by_recipient_partition = GroupControlByRecipientPartition::new(&tx_keyspace)?;
     let tx_id_to_group_control_partition = TxIdToGroupControlPartition::new(&tx_keyspace)?;
     let tx_id_to_acceptance_partition = TxIDToAcceptancePartition::new(&tx_keyspace)?;
     let block_compact_header_partition = BlockCompactHeaderPartition::new(&tx_keyspace)?;
@@ -108,6 +110,8 @@ async fn main() -> anyhow::Result<()> {
     let block_daa_index_partition = DaaIndexPartition::new(&tx_keyspace)?;
     let device_registration_partition = DeviceRegistrationPartition::new(&tx_keyspace)?;
     let watched_address_partition = WatchedAddressPartition::new(&tx_keyspace)?;
+    let watched_group_id_partition = WatchedGroupIdPartition::new(&tx_keyspace)?;
+    let primary_address_partition = PrimaryAddressPartition::new(&tx_keyspace)?;
 
     let gaps = block_gaps_partition
         .get_all_gaps()
@@ -161,6 +165,8 @@ async fn main() -> anyhow::Result<()> {
         tx_keyspace.clone(),
         device_registration_partition,
         watched_address_partition,
+        watched_group_id_partition,
+        primary_address_partition,
         metrics.clone(),
     );
     let (push_registry_actor, push_registry) =
@@ -214,9 +220,9 @@ async fn main() -> anyhow::Result<()> {
             group_message_by_blinded_group_id_partition.clone(),
         )
         .tx_id_to_group_message_partition(tx_id_to_group_message_partition.clone())
-        .group_invite_by_tag_partition(group_invite_by_tag_partition.clone())
-        .tx_id_to_group_invite_partition(tx_id_to_group_invite_partition.clone())
+        .group_sender_binding_partition(group_sender_binding_partition.clone())
         .group_control_by_sender_partition(group_control_by_sender_partition.clone())
+        .group_control_by_recipient_partition(group_control_by_recipient_partition.clone())
         .tx_id_to_group_control_partition(tx_id_to_group_control_partition.clone())
         .tx_id_to_acceptance_partition(tx_id_to_acceptance_partition.clone())
         .shared_metrics(metrics.clone())
@@ -247,8 +253,11 @@ async fn main() -> anyhow::Result<()> {
         .group_message_by_blinded_group_id_partition(
             group_message_by_blinded_group_id_partition.clone(),
         )
-        .group_invite_by_tag_partition(group_invite_by_tag_partition.clone())
+        .tx_id_to_group_message_partition(tx_id_to_group_message_partition.clone())
+        .group_sender_binding_partition(group_sender_binding_partition)
         .group_control_by_sender_partition(group_control_by_sender_partition.clone())
+        .group_control_by_recipient_partition(group_control_by_recipient_partition.clone())
+        .tx_id_to_group_control_partition(tx_id_to_group_control_partition.clone())
         .runtime(tokio::runtime::Handle::current())
         .push_tx(push_tx.clone())
         .build();
@@ -322,14 +331,13 @@ async fn main() -> anyhow::Result<()> {
         tx_id_to_self_stash_partition,
         group_message_by_blinded_group_id_partition,
         tx_id_to_group_message_partition,
-        group_invite_by_tag_partition,
-        tx_id_to_group_invite_partition,
         group_control_by_sender_partition,
+        group_control_by_recipient_partition,
         tx_id_to_group_control_partition,
         metrics.clone(),
         api::v1::push::PushApi::new(
             push_registry.clone(),
-            context.network_type.into(),
+            context.network_type,
             context.config.push_auth_mode,
             context.config.apns_team_id.clone(),
             context.config.apns_topic.clone(),

@@ -67,6 +67,10 @@ impl GroupMessageByBlindedGroupIdPartition {
         Ok(())
     }
 
+    pub fn remove_wtx(&self, wtx: &mut WriteTransaction, key: &GroupMessageKeyByBlindedGroupId) {
+        wtx.remove(&self.0, key.as_bytes());
+    }
+
     pub fn iter_by_blinded_group_id_from_block_time_rtx(
         &self,
         rtx: &ReadTransaction,
@@ -123,6 +127,10 @@ impl TxIdToGroupMessagePartition {
         wtx.insert(&self.0, tx_id, sealed_hex);
     }
 
+    pub fn remove_wtx(&self, wtx: &mut WriteTransaction, tx_id: &[u8; 32]) {
+        wtx.remove(&self.0, tx_id);
+    }
+
     pub fn get_rtx(
         &self,
         rtx: &ReadTransaction,
@@ -131,5 +139,39 @@ impl TxIdToGroupMessagePartition {
         rtx.get(&self.0, tx_id)
             .map(|bts| bts.map(SharedImmutable::new))
             .map_err(anyhow::Error::from)
+    }
+}
+
+/// Pins a sender-specific blinded group id to the first validated transaction pubkey that uses
+/// it. Since the id is a 256-bit secret-derived value, this prevents an observer from copying an
+/// id into later transactions and causing push amplification with another signing key.
+#[derive(Clone)]
+pub struct GroupSenderBindingPartition(fjall::TxPartition);
+
+impl GroupSenderBindingPartition {
+    pub fn new(keyspace: &fjall::TxKeyspace) -> Result<Self> {
+        Ok(Self(keyspace.open_partition(
+            "group_sender_binding",
+            PartitionCreateOptions::default(),
+        )?))
+    }
+
+    /// Returns true when the binding is new or matches the existing binding.
+    pub fn check_or_bind_wtx(
+        &self,
+        wtx: &mut WriteTransaction,
+        blinded_group_id: &[u8; BLINDED_GROUP_ID_LEN],
+        sender_pubkey: &[u8; 32],
+    ) -> Result<bool> {
+        let previous = wtx.fetch_update(&self.0, blinded_group_id, |old| {
+            Some(match old {
+                Some(value) => value.clone(),
+                None => sender_pubkey.as_slice().into(),
+            })
+        })?;
+        Ok(previous
+            .as_ref()
+            .map(|value| value.as_ref() == sender_pubkey)
+            .unwrap_or(true))
     }
 }

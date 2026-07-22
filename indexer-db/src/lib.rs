@@ -36,6 +36,21 @@ impl Default for AddressPayload {
     }
 }
 
+impl AddressPayload {
+    pub fn from_xonly_pubkey(pubkey: [u8; 32]) -> Self {
+        let mut payload = [0u8; 33];
+        payload[..32].copy_from_slice(&pubkey);
+        Self {
+            inverse_version: u8::MAX - Version::PubKey as u8,
+            payload,
+        }
+    }
+
+    pub fn matches_xonly_pubkey(&self, pubkey: &[u8; 32]) -> bool {
+        self.inverse_version == u8::MAX - Version::PubKey as u8 && self.payload[..32] == pubkey[..]
+    }
+}
+
 impl TryFrom<&ScriptPublicKey> for AddressPayload {
     type Error = anyhow::Error;
 
@@ -152,8 +167,10 @@ pub enum PartitionId {
 
     GroupMessageByBlindedGroupId = 17,
     TxIdToGroupMessage = 18,
+    // Reserved for compatibility with databases created by the original group-chat PR.
     GroupInviteByTag = 19,
     TxIdToGroupInvite = 20,
     GroupControlBySender = 21,
     TxIdToGroupControl = 22,
+    GroupControlByRecipient = 23,
 }

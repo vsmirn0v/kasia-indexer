@@ -281,7 +281,7 @@ async fn get_handshakes_by_receiver(
                             to_rpc_address(&sender_payload, state.context.network_type)
                                 .context(format!(
                                     "Address conversion error (sender_payload={:?})",
-                                    &sender_payload.deref()
+                                    sender_payload.deref()
                                 ))?
                                 .map(|a| a.to_string())
                                 .unwrap_or_default();

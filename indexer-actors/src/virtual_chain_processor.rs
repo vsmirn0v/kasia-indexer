@@ -9,10 +9,13 @@ use indexer_db::messages::contextual_message::{
     ContextualMessageBySenderKey, ContextualMessageBySenderPartition,
     TxIdToContextualMessagePartition,
 };
-use indexer_db::messages::group_control::{GroupControlBySenderPartition, GroupControlKeyBySender};
-use indexer_db::messages::group_invite::{GroupInviteByTagPartition, GroupInviteKeyByTag};
+use indexer_db::messages::group_control::{
+    GroupControlByRecipientPartition, GroupControlBySenderPartition, GroupControlKeyByRecipient,
+    GroupControlKeyBySender, TxIdToGroupControlPartition,
+};
 use indexer_db::messages::group_message::{
     GroupMessageByBlindedGroupIdPartition, GroupMessageKeyByBlindedGroupId,
+    GroupSenderBindingPartition, TxIdToGroupMessagePartition,
 };
 use indexer_db::messages::handshake::{
     HandshakeByReceiverPartition, HandshakeBySenderPartition, HandshakeKeyByReceiver,
@@ -40,6 +43,7 @@ use kaspa_rpc_core::{
     VirtualChainChangedNotification,
 };
 pub use message::*;
+use protocol::operation::{SealedOperation, deserializer::parse_sealed_operation};
 use std::collections::VecDeque;
 use std::time::Instant;
 use tracing::{debug, error, info, info_span, trace, warn};
@@ -76,8 +80,11 @@ pub struct VirtualProcessor {
     tx_id_to_self_stash_partition: TxIdToSelfStashPartition,
 
     group_message_by_blinded_group_id_partition: GroupMessageByBlindedGroupIdPartition,
-    group_invite_by_tag_partition: GroupInviteByTagPartition,
+    tx_id_to_group_message_partition: TxIdToGroupMessagePartition,
+    group_sender_binding_partition: GroupSenderBindingPartition,
     group_control_by_sender_partition: GroupControlBySenderPartition,
+    group_control_by_recipient_partition: GroupControlByRecipientPartition,
+    tx_id_to_group_control_partition: TxIdToGroupControlPartition,
 
     runtime: tokio::runtime::Handle,
     push_tx: Option<flume::Sender<PushEvent>>,
@@ -781,6 +788,7 @@ impl VirtualProcessor {
                     | PartitionId::PendingSenders
                     | PartitionId::TxIDToSelfStash
                     | PartitionId::TxIdToGroupMessage
+                    | PartitionId::GroupInviteByTag
                     | PartitionId::TxIdToGroupInvite
                     | PartitionId::TxIdToGroupControl => {
                         panic!("Unexpected partition id")
@@ -796,7 +804,9 @@ impl VirtualProcessor {
                     PartitionId::GroupMessageByBlindedGroupId => {
                         size_of::<GroupMessageKeyByBlindedGroupId>()
                     }
-                    PartitionId::GroupInviteByTag => size_of::<GroupInviteKeyByTag>(),
+                    PartitionId::GroupControlByRecipient => {
+                        size_of::<GroupControlKeyByRecipient>()
+                    }
                     PartitionId::GroupControlBySender => size_of::<GroupControlKeyBySender>(),
                 },
                 |wtx, entry| match entry.partition_id {
@@ -811,6 +821,7 @@ impl VirtualProcessor {
                     | PartitionId::PendingSenders
                     | PartitionId::TxIDToSelfStash
                     | PartitionId::TxIdToGroupMessage
+                    | PartitionId::GroupInviteByTag
                     | PartitionId::TxIdToGroupInvite
                     | PartitionId::TxIdToGroupControl => {
                         panic!("Unexpected partition id")
@@ -843,6 +854,8 @@ impl VirtualProcessor {
                             payload,
                             timestamp: key.block_time.into(),
                             daa_score: daa,
+                            blinded_group_id: None,
+                            group_control_recipient: None,
                         });
                         Ok(())
                     }
@@ -888,6 +901,8 @@ impl VirtualProcessor {
                             payload,
                             timestamp: key.block_time.into(),
                             daa_score: daa,
+                            blinded_group_id: None,
+                            group_control_recipient: None,
                         });
                         Ok(())
                     }
@@ -923,6 +938,8 @@ impl VirtualProcessor {
                                 payload,
                                 timestamp: key.block_time.into(),
                                 daa_score: daa,
+                                blinded_group_id: None,
+                                group_control_recipient: None,
                             });
                         } else {
                             trace!(sender = ?sender, "Skipping payment push: receiver matches sender");
@@ -965,6 +982,8 @@ impl VirtualProcessor {
                             payload,
                             timestamp: key.block_time.into(),
                             daa_score: daa,
+                            blinded_group_id: None,
+                            group_control_recipient: None,
                         });
                         Ok(())
                     }
@@ -972,20 +991,65 @@ impl VirtualProcessor {
                         if !matches!(entry.action, Action::UpdateValueSender) {
                             panic!("Unexpected action")
                         }
-                        self.group_message_by_blinded_group_id_partition.insert_wtx(
-                            wtx,
-                            GroupMessageKeyByBlindedGroupId::try_ref_from_bytes(entry.key)
-                                .map_err(|_| anyhow::anyhow!("Key conversion error"))?,
-                            Some(sender),
-                        )
+                        let key = GroupMessageKeyByBlindedGroupId::try_ref_from_bytes(entry.key)
+                            .map_err(|_| anyhow::anyhow!("Key conversion error"))?;
+                        let payload = self
+                            .tx_id_to_group_message_partition
+                            .get_rtx(&rtx, &key.tx_id)?
+                            .ok_or_else(|| anyhow::anyhow!("Missing group message payload"))?;
+                        let wire_payload = format!(
+                            "ciph_msg:1:gcomm:{}",
+                            String::from_utf8_lossy(payload.as_ref())
+                        );
+                        let Some(SealedOperation::GroupMessageV1(message)) =
+                            parse_sealed_operation(wire_payload.as_bytes())
+                        else {
+                            self.group_message_by_blinded_group_id_partition
+                                .remove_wtx(wtx, key);
+                            self.tx_id_to_group_message_partition
+                                .remove_wtx(wtx, &key.tx_id);
+                            return Ok(());
+                        };
+                        let sender_pubkey = decode_fixed_hex::<32>(message.sender_pub)?;
+                        if !sender.matches_xonly_pubkey(&sender_pubkey)
+                            || !self.group_sender_binding_partition.check_or_bind_wtx(
+                                wtx,
+                                &key.blinded_group_id,
+                                &sender_pubkey,
+                            )?
+                        {
+                            warn!(tx_id = %key.tx_id.to_hex_64(), "Rejecting group message after sender resolution");
+                            self.group_message_by_blinded_group_id_partition
+                                .remove_wtx(wtx, key);
+                            self.tx_id_to_group_message_partition
+                                .remove_wtx(wtx, &key.tx_id);
+                            return Ok(());
+                        }
+                        self.group_message_by_blinded_group_id_partition
+                            .insert_wtx(wtx, key, Some(sender))?;
+                        push_events.borrow_mut().push(PushEvent {
+                            kind: PushEventKind::GroupMessage,
+                            watched_address: AddressPayload::default(),
+                            sender,
+                            receiver: AddressPayload::default(),
+                            alias: None,
+                            tx_id: key.tx_id,
+                            amount: None,
+                            payload: Some(String::from_utf8_lossy(payload.as_ref()).to_string()),
+                            timestamp: key.block_time.into(),
+                            daa_score: daa,
+                            blinded_group_id: Some(key.blinded_group_id),
+                            group_control_recipient: None,
+                        });
+                        Ok(())
                     }
-                    PartitionId::GroupInviteByTag => {
+                    PartitionId::GroupControlByRecipient => {
                         if !matches!(entry.action, Action::UpdateValueSender) {
                             panic!("Unexpected action")
                         }
-                        self.group_invite_by_tag_partition.insert_wtx(
+                        self.group_control_by_recipient_partition.insert_wtx(
                             wtx,
-                            GroupInviteKeyByTag::try_ref_from_bytes(entry.key)
+                            GroupControlKeyByRecipient::try_ref_from_bytes(entry.key)
                                 .map_err(|_| anyhow::anyhow!("Key conversion error"))?,
                             Some(sender),
                         )
@@ -998,6 +1062,26 @@ impl VirtualProcessor {
                             .map_err(|_| anyhow::anyhow!("Key conversion error"))?;
                         key.sender = sender;
                         self.group_control_by_sender_partition.insert_wtx(wtx, &key);
+                        let payload = self
+                            .tx_id_to_group_control_partition
+                            .get_rtx(&rtx, &key.tx_id)?
+                            .map(|bytes| String::from_utf8_lossy(bytes.as_ref()).to_string());
+                        let recipient = (key.recipient != AddressPayload::default())
+                            .then_some(key.recipient);
+                        push_events.borrow_mut().push(PushEvent {
+                            kind: PushEventKind::GroupControl,
+                            watched_address: sender,
+                            sender,
+                            receiver: key.recipient,
+                            alias: None,
+                            tx_id: key.tx_id,
+                            amount: None,
+                            payload,
+                            timestamp: key.block_time.into(),
+                            daa_score: daa,
+                            blinded_group_id: None,
+                            group_control_recipient: recipient,
+                        });
                         Ok(())
                     }
                 },
@@ -1026,6 +1110,19 @@ impl Drop for VirtualProcessor {
             .send_blocking(Command::MarkVccSenderClosed)
             .inspect_err(|_| error!("Error sending command to mark vcc sender closed"));
     }
+}
+
+fn decode_fixed_hex<const N: usize>(hex_bytes: &[u8]) -> anyhow::Result<[u8; N]> {
+    if hex_bytes.len() != N * 2 {
+        anyhow::bail!(
+            "unexpected hex field length: expected {}, got {}",
+            N * 2,
+            hex_bytes.len()
+        );
+    }
+    let mut out = [0u8; N];
+    faster_hex::hex_decode(hex_bytes, &mut out)?;
+    Ok(out)
 }
 
 enum ProcessedBlockOrVccOrSyncer {
@@ -1100,7 +1197,7 @@ mod tests {
         print_size::<PaymentKeyBySender>();
         print_size::<SelfStashKeyByOwner>();
         print_size::<GroupMessageKeyByBlindedGroupId>();
-        print_size::<GroupInviteKeyByTag>();
+        print_size::<GroupControlKeyByRecipient>();
         print_size::<GroupControlKeyBySender>();
     }
 }

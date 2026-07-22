@@ -1,6 +1,6 @@
 use crate::operation::{
-    SealedContextualMessageV1, SealedHandshakeV2, SealedMessageOrSealedHandshakeVNone,
-    SealedOperation, SealedPaymentV1, SealedSelfStashV1,
+    SealedContextualMessageV1, SealedGroupControlV1, SealedGroupMessageV1, SealedHandshakeV2,
+    SealedMessageOrSealedHandshakeVNone, SealedOperation, SealedPaymentV1, SealedSelfStashV1,
 };
 use tracing::warn;
 
@@ -93,6 +93,49 @@ pub fn parse_sealed_operation(payload_bytes: &[u8]) -> Option<SealedOperation<'_
                     sealed_hex: remaining,
                 })),
             }
+        }
+        Some([b'g', b'c', b'o', b'm', b'm', b':', remaining @ ..]) => {
+            let full = remaining;
+
+            let idx1 = remaining.iter().position(|b| b == &b':')?;
+            let blinded_group_id = &remaining[..idx1];
+            let remaining = &remaining[idx1 + 1..];
+
+            let idx2 = remaining.iter().position(|b| b == &b':')?;
+            let epoch = &remaining[..idx2];
+            let remaining = &remaining[idx2 + 1..];
+
+            let idx3 = remaining.iter().position(|b| b == &b':')?;
+            let sender_id = &remaining[..idx3];
+            let remaining = &remaining[idx3 + 1..];
+
+            let idx4 = remaining.iter().position(|b| b == &b':')?;
+            let sender_pub = &remaining[..idx4];
+            let remaining = &remaining[idx4 + 1..];
+
+            let idx5 = remaining.iter().position(|b| b == &b':')?;
+            let msg_id = &remaining[..idx5];
+            let remaining = &remaining[idx5 + 1..];
+
+            let idx6 = remaining.iter().position(|b| b == &b':')?;
+            let ciphertext = &remaining[..idx6];
+            let signature = &remaining[idx6 + 1..];
+
+            Some(SealedOperation::GroupMessageV1(SealedGroupMessageV1 {
+                blinded_group_id,
+                epoch,
+                sender_id,
+                sender_pub,
+                msg_id,
+                ciphertext,
+                signature,
+                sealed_hex: full,
+            }))
+        }
+        Some([b'g', b'c', b't', b'l', b':', sealed_hex @ ..]) => {
+            Some(SealedOperation::GroupControlV1(SealedGroupControlV1 {
+                sealed_hex,
+            }))
         }
         Some(msg_type_and_content) => {
             let msg_type_and_content = faster_hex::hex_string(msg_type_and_content);

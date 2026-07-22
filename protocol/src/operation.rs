@@ -98,12 +98,6 @@ pub struct SealedGroupMessageV1<'a> {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub struct SealedGroupInviteV1<'a> {
-    pub invite_tag: &'a [u8],
-    pub encrypted_payload: &'a [u8],
-}
-
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct SealedGroupControlV1<'a> {
     pub sealed_hex: &'a [u8],
 }
@@ -139,10 +133,6 @@ pub enum SealedOperation<'a> {
      */
     GroupMessageV1(SealedGroupMessageV1<'a>),
     /**
-     * "ciph_msg:1:ginv:{invite_tag}:{encrypted_payload}"
-     */
-    GroupInviteV1(SealedGroupInviteV1<'a>),
-    /**
      * "ciph_msg:1:gctl:{hex_encrypted_bytes}"
      */
     GroupControlV1(SealedGroupControlV1<'a>),
@@ -161,7 +151,6 @@ impl<'a> SealedOperation<'a> {
             SealedOperation::SelfStashV1(_) => "SelfStashV1",
             SealedOperation::SealedHandshakeV2(_) => "HandshakeV2",
             SealedOperation::GroupMessageV1(_) => "GroupMessageV1",
-            SealedOperation::GroupInviteV1(_) => "GroupInviteV1",
             SealedOperation::GroupControlV1(_) => "GroupControlV1",
         }
     }
@@ -281,19 +270,6 @@ mod tests {
         let payload = b"ciph_msg:1:gcomm:aabb:42:ccdd";
         let result = parse_sealed_operation(payload);
         assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_deserialize_sealed_group_invite() {
-        let payload = b"ciph_msg:1:ginv:aabb:ccddeeff";
-        let result = parse_sealed_operation(payload);
-        assert_eq!(
-            result,
-            Some(SealedOperation::GroupInviteV1(SealedGroupInviteV1 {
-                invite_tag: b"aabb",
-                encrypted_payload: b"ccddeeff",
-            }))
-        );
     }
 
     #[test]

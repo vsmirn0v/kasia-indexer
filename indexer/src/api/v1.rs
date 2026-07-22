@@ -1,12 +1,13 @@
 use crate::api::v1::contextual_messages::ContextualMessageApi;
 use crate::api::v1::group_control::GroupControlApi;
-use crate::api::v1::group_invites::GroupInviteApi;
 use crate::api::v1::group_messages::GroupMessageApi;
 use crate::api::v1::handshakes::HandshakeApi;
 use crate::api::v1::payments::PaymentApi;
+use crate::api::v1::push::PushApi;
 use crate::api::v1::self_stash::SelfStashApi;
 use crate::context::IndexerContext;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -17,7 +18,6 @@ use indexer_db::messages::contextual_message::{
 use indexer_db::messages::group_control::{
     GroupControlBySenderPartition, TxIdToGroupControlPartition,
 };
-use indexer_db::messages::group_invite::{GroupInviteByTagPartition, TxIdToGroupInvitePartition};
 use indexer_db::messages::group_message::{
     GroupMessageByBlindedGroupIdPartition, TxIdToGroupMessagePartition,
 };
@@ -36,11 +36,14 @@ use utoipa_swagger_ui::SwaggerUi;
 
 pub mod contextual_messages;
 pub mod group_control;
-pub mod group_invites;
 pub mod group_messages;
 pub mod handshakes;
 pub mod payments;
+mod prometheus;
+pub mod push;
 pub mod self_stash;
+
+const PUSH_REQUEST_BODY_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -52,12 +55,16 @@ pub mod self_stash;
         payments::get_payments_by_receiver,
         self_stash::get_self_stash_by_owner,
         group_messages::get_group_messages_by_blinded_group_id,
-        group_invites::get_group_invites_by_tag,
         group_control::get_group_control_by_sender,
+        push::create_challenge,
+        push::register_device,
+        push::update_registration,
+        push::unregister_device,
         get_metrics,
+        get_prometheus_metrics,
     ),
     components(
-        schemas(handshakes::HandshakeResponse, contextual_messages::ContextualMessageResponse, payments::PaymentResponse, self_stash::SelfStashResponse, group_messages::GroupMessageResponse, group_invites::GroupInviteResponse, group_control::GroupControlResponse, IndexerMetricsSnapshot)
+        schemas(handshakes::HandshakeResponse, contextual_messages::ContextualMessageResponse, payments::PaymentResponse, self_stash::SelfStashResponse, group_messages::GroupMessageResponse, group_control::GroupControlResponse, push::PushRegistrationRequest, push::PushUpdateRequest, push::PushUnregisterRequest, push::PushAuthRequest, push::PushChallengeResponse, push::PushResponse, push::ErrorResponse, IndexerMetricsSnapshot)
     ),
     tags(
         (name = "Kasia Indexer API", description = "Kasia Indexer API")
@@ -72,8 +79,8 @@ pub struct Api {
     payment_api: PaymentApi,
     self_stash_api: SelfStashApi,
     group_message_api: GroupMessageApi,
-    group_invite_api: GroupInviteApi,
     group_control_api: GroupControlApi,
+    push_api: PushApi,
     metrics: SharedMetrics,
 }
 
@@ -94,11 +101,10 @@ impl Api {
         tx_id_to_self_stash_partition: TxIdToSelfStashPartition,
         group_message_by_blinded_group_id_partition: GroupMessageByBlindedGroupIdPartition,
         tx_id_to_group_message_partition: TxIdToGroupMessagePartition,
-        group_invite_by_tag_partition: GroupInviteByTagPartition,
-        tx_id_to_group_invite_partition: TxIdToGroupInvitePartition,
         group_control_by_sender_partition: GroupControlBySenderPartition,
         tx_id_to_group_control_partition: TxIdToGroupControlPartition,
         metrics: SharedMetrics,
+        push_api: PushApi,
         context: IndexerContext,
     ) -> Self {
         let handshake_api = HandshakeApi::new(
@@ -143,14 +149,6 @@ impl Api {
             context.clone(),
         );
 
-        let group_invite_api = GroupInviteApi::new(
-            tx_keyspace.clone(),
-            group_invite_by_tag_partition,
-            tx_id_to_acceptance_partition.clone(),
-            tx_id_to_group_invite_partition,
-            context.clone(),
-        );
-
         let group_control_api = GroupControlApi::new(
             tx_keyspace,
             group_control_by_sender_partition,
@@ -165,8 +163,8 @@ impl Api {
             payment_api,
             self_stash_api,
             group_message_api,
-            group_invite_api,
             group_control_api,
+            push_api,
             metrics,
         }
     }
@@ -189,6 +187,10 @@ impl Api {
     }
 
     fn router(&self) -> Router {
+        let push_router = PushApi::router()
+            .with_state(self.push_api.clone())
+            .layer(DefaultBodyLimit::max(PUSH_REQUEST_BODY_MAX_BYTES));
+
         Router::new()
             .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
             .nest(
@@ -212,19 +214,34 @@ impl Api {
                 GroupMessageApi::router().with_state(self.group_message_api.clone()),
             )
             .nest(
-                "/group-invites",
-                GroupInviteApi::router().with_state(self.group_invite_api.clone()),
-            )
-            .nest(
                 "/group-control",
                 GroupControlApi::router().with_state(self.group_control_api.clone()),
             )
+            .nest("/v1/push", push_router)
             .route(
                 "/metrics",
                 get(get_metrics).with_state(self.metrics.clone()),
             )
+            .route(
+                "/metrics/prometheus",
+                get(get_prometheus_metrics).with_state(self.metrics.clone()),
+            )
             .layer(CorsLayer::permissive())
     }
+}
+
+#[utoipa::path(
+    get,
+    path = "/metrics/prometheus",
+    responses(
+        (status = 200, description = "Get Prometheus metrics", content_type = "text/plain", body = String)
+    )
+)]
+async fn get_prometheus_metrics(State(metrics): State<SharedMetrics>) -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, prometheus::CONTENT_TYPE)],
+        prometheus::render(&metrics.snapshot()),
+    )
 }
 
 #[utoipa::path(

@@ -1,7 +1,6 @@
 use crate::operation::{
-    SealedContextualMessageV1, SealedGroupControlV1, SealedGroupInviteV1, SealedGroupMessageV1,
-    SealedHandshakeV2, SealedMessageOrSealedHandshakeVNone, SealedOperation, SealedPaymentV1,
-    SealedSelfStashV1,
+    SealedContextualMessageV1, SealedGroupControlV1, SealedGroupMessageV1, SealedHandshakeV2,
+    SealedMessageOrSealedHandshakeVNone, SealedOperation, SealedPaymentV1, SealedSelfStashV1,
 };
 use tracing::warn;
 
@@ -131,15 +130,6 @@ pub fn parse_sealed_operation(payload_bytes: &[u8]) -> Option<SealedOperation<'_
                 ciphertext,
                 signature,
                 sealed_hex: full,
-            }))
-        }
-        Some([b'g', b'i', b'n', b'v', b':', remaining @ ..]) => {
-            let delimiter_idx = remaining.iter().position(|b| b == &b':')?;
-            let invite_tag = &remaining[..delimiter_idx];
-            let encrypted_payload = &remaining[delimiter_idx + 1..];
-            Some(SealedOperation::GroupInviteV1(SealedGroupInviteV1 {
-                invite_tag,
-                encrypted_payload,
             }))
         }
         Some([b'g', b'c', b't', b'l', b':', sealed_hex @ ..]) => {
